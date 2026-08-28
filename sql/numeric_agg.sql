@@ -1,0 +1,518 @@
+CREATE EXTENSION pg_prosupport;
+
+-- The support function is attached by writing pg_proc.prosupport, which is what
+-- the README tells the user to do and the only thing that works on a stock
+-- server: ALTER FUNCTION refuses aggregates and ALTER AGGREGATE has no SUPPORT
+-- clause.  The field itself is stock, and so is the request the planner sends
+-- through it.
+UPDATE pg_proc SET prosupport = 'pps_agg_support'::regproc
+ WHERE oid IN ('pg_catalog.sum(numeric)'::regprocedure,
+			   'pg_catalog.avg(numeric)'::regprocedure);
+
+--
+-- When the substitution happens and when it does not
+--
+CREATE TABLE t_ok    (v numeric(18,2));
+CREATE TABLE t_wide  (v numeric(19,2));
+CREATE TABLE t_w28   (v numeric(28,20));
+CREATE TABLE t_w29   (v numeric(29,2));
+CREATE TABLE t_plain (v numeric);
+CREATE TABLE t_int0  (v numeric(18,0));
+CREATE TABLE t_frac  (v numeric(18,18));
+CREATE DOMAIN money18 AS numeric(18,2);
+CREATE TABLE t_dom   (v money18);
+-- A domain over a domain: getBaseTypeAndTypmod() runs a loop and its inner
+-- Assert(*typmod == -1) only holds because the intermediate domain has
+-- typtypmod = -1.  Verify by running it rather than by reasoning about it.
+CREATE DOMAIN money18_2 AS money18;
+CREATE TABLE t_dom2  (v money18_2);
+
+EXPLAIN (verbose, costs off) SELECT sum(v) FROM t_ok;
+EXPLAIN (verbose, costs off) SELECT sum(v) FROM t_int0;
+EXPLAIN (verbose, costs off) SELECT sum(v) FROM t_frac;
+-- A domain over numeric(18,2): substituted, with the typmod taken from the domain
+EXPLAIN (verbose, costs off) SELECT sum(v) FROM t_dom;
+EXPLAIN (verbose, costs off) SELECT sum(v) FROM t_dom2;
+SELECT sum(v) FROM (VALUES ('1.005'::money18_2), ('2.00')) x(v);
+-- 19 <= p <= 28 uses the same aggregate: the mantissa is in int128 anyway
+EXPLAIN (verbose, costs off) SELECT sum(v) FROM t_wide;
+EXPLAIN (verbose, costs off) SELECT sum(v) FROM t_w28;
+-- p = 29 > 28: the accumulator no longer has comfortable headroom, leave it to core
+EXPLAIN (verbose, costs off) SELECT sum(v) FROM t_w29;
+-- no typmod at all
+EXPLAIN (verbose, costs off) SELECT sum(v) FROM t_plain;
+-- The argument need not be a column: exprTypmod() yields a typmod for CASE and
+-- COALESCE when it is the same in every arm, and then every value really does
+-- carry the required dscale.
+EXPLAIN (verbose, costs off)
+  SELECT sum(CASE WHEN v > 0 THEN v ELSE v END) FROM t_ok;
+EXPLAIN (verbose, costs off) SELECT sum(coalesce(v, v)) FROM t_ok;
+-- with arms of differing typmod it is lost, and there must be no substitution
+EXPLAIN (verbose, costs off)
+  SELECT sum(CASE WHEN v > 0 THEN v ELSE 0::numeric END) FROM t_ok;
+
+-- A PREPARE parameter never qualifies for the typmod path: its paramtypmod is
+-- -1 even when the type was declared numeric(18,2), and the value is bound
+-- without the typmod being applied.
+--
+-- Which of the two things happens instead depends on the plan.  A custom plan
+-- is built with the parameter bound, so it is folded to a Const before the
+-- support function is called and the constant rewrite fires on it -- correctly:
+-- the value is whatever this execution supplied, and the plan is only used for
+-- this execution.  A generic plan is built with no bound parameters at all, the
+-- Param survives constant folding, and nothing fires.
+PREPARE pparam (numeric(18,2)) AS SELECT sum(x) FROM (VALUES ($1)) t(x);
+EXPLAIN (verbose, costs off) EXECUTE pparam ('1.00');
+EXECUTE pparam ('1.23456');
+SET plan_cache_mode = force_generic_plan;
+EXPLAIN (verbose, costs off) EXECUTE pparam ('1.00');
+EXECUTE pparam ('1.23456');
+RESET plan_cache_mode;
+DEALLOCATE pparam;
+
+--
+-- Arithmetic arguments.  exprTypmod() gives up on an OpExpr, so the bounds are
+-- derived from the operands: a product has scale s1+s2 and at most p1+p2
+-- digits, a sum or difference has scale max(s1,s2) and at most
+-- max(p1-s1,p2-s2)+1+max(s1,s2).  Division is excluded on purpose --
+-- select_div_scale() derives the quotient's scale from the values, not the
+-- typmods.
+--
+CREATE TABLE t_ab (a numeric(10,2), b numeric(12,4), c numeric(20,10));
+
+-- 10 + 12 = 22 digits, scale 2 + 4 = 6
+EXPLAIN (verbose, costs off) SELECT sum(a * b) FROM t_ab;
+-- max(8,8) + 1 + 4 = 13 digits, scale max(2,4) = 4
+EXPLAIN (verbose, costs off) SELECT sum(a + b) FROM t_ab;
+EXPLAIN (verbose, costs off) SELECT sum(a - b) FROM t_ab;
+EXPLAIN (verbose, costs off) SELECT sum(-a) FROM t_ab;
+-- nested: (a * b) + a is 22 digits at scale 6, then max(16,8)+1+6 = 23
+EXPLAIN (verbose, costs off) SELECT sum(a * b + a) FROM t_ab;
+-- constants carry no typmod, so their digits are counted from the value
+EXPLAIN (verbose, costs off) SELECT sum(a * 1.2) FROM t_ab;
+EXPLAIN (verbose, costs off) SELECT sum(a - 1) FROM t_ab;
+EXPLAIN (verbose, costs off) SELECT sum(a * 0.05) FROM t_ab;
+-- A cast inside the product: this is the shape that shows up in reporting
+-- queries, and exprTypmod() does return the typmod of a length coercion.
+EXPLAIN (verbose, costs off) SELECT sum(a * c::numeric(14,4)) FROM t_ab;
+-- round() and trunc() with a constant scale: numeric_round() sets the result's
+-- dscale to exactly max(n,0), and rounding can carry one extra integer digit
+EXPLAIN (verbose, costs off) SELECT sum(round(a * b, 2)) FROM t_ab;
+EXPLAIN (verbose, costs off) SELECT sum(trunc(a * b, 2)) FROM t_ab;
+EXPLAIN (verbose, costs off) SELECT sum(round(a * b)) FROM t_ab;
+EXPLAIN (verbose, costs off) SELECT sum(round(a, -1)) FROM t_ab;
+-- a non-constant scale is not known at plan time
+EXPLAIN (verbose, costs off) SELECT sum(round(a, g)) FROM t_ab, generate_series(1,2) g;
+-- 10 + 20 = 30 > 28: too wide, left to core
+EXPLAIN (verbose, costs off) SELECT sum(a * c) FROM t_ab;
+-- division is never derived
+EXPLAIN (verbose, costs off) SELECT sum(a / b) FROM t_ab;
+-- neither is an unbounded operand
+EXPLAIN (verbose, costs off) SELECT sum(a * v) FROM t_ab, t_plain;
+
+--
+-- A product at the top of the argument is taken apart and folded into the
+-- transition function, so that no intermediate numeric is built at all.  The
+-- factors need not be columns; each side goes through the same derivation.
+--
+CREATE TABLE t_mul (grp int, a numeric(10,2), b numeric(8,4),
+					d numeric(20,2), e numeric(6,2));
+
+EXPLAIN (verbose, costs off) SELECT sum(a * b) FROM t_mul;
+EXPLAIN (verbose, costs off) SELECT avg(a * b) FROM t_mul;
+EXPLAIN (verbose, costs off) SELECT sum((a + 1) * b) FROM t_mul;
+EXPLAIN (verbose, costs off) SELECT sum(a * 1.2) FROM t_mul;
+EXPLAIN (verbose, costs off) SELECT sum(round(a, 1) * b) FROM t_mul;
+-- the product is not at the top: the sum is still specialised, the
+-- multiplication is not
+EXPLAIN (verbose, costs off) SELECT sum(a * b + a) FROM t_mul;
+-- a factor wider than 18 digits cannot go through int128_add_int64_mul_int64,
+-- so this falls back to specialising only the accumulation
+EXPLAIN (verbose, costs off) SELECT sum(d * e) FROM t_mul;
+-- The fold nests: (a * b) is itself derivable at 18 digits, so it becomes the
+-- left factor and only the outer multiplication is folded away.  The inner one
+-- is still numeric_mul(), which is why 18 + 10 = 28 has to fit.
+EXPLAIN (verbose, costs off) SELECT sum(a * b * a) FROM t_mul;
+-- one more digit on either side and nothing fits any more
+EXPLAIN (verbose, costs off) SELECT sum(a * b * d) FROM t_mul;
+
+INSERT INTO t_mul VALUES
+	(1,  1.25,  3.1234,  1.00,  1.00),
+	(1, -0.10,  0.0001, -2.50,  3.00),
+	(1,  0.00,  9999.9999, 0.00, 0.00),
+	(2,  99999999.99,  9999.9999,  999999999999999999.99,  9999.99),
+	(2, -99999999.99, -9999.9999, -999999999999999999.99, -9999.99),
+	(3,  0.01,  0.0001, 0.01, 0.01),
+	(3,  NULL,  1.0000, NULL, 1.00),
+	(3,  1.00,  NULL,   1.00, NULL),
+	(4, 'NaN', 1.0000, 'NaN', 1.00),
+	(4,  2.00, 3.0000,  2.00, 3.00);
+
+SET pg_prosupport.enabled = off;
+CREATE TABLE t_mulref AS
+	SELECT grp,
+		   sum(a * b)::text          AS s1,
+		   avg(a * b)::text          AS s2,
+		   sum((a + 1) * b)::text    AS s3,
+		   sum(a * 1.2)::text        AS s4,
+		   sum(round(a, 1) * b)::text AS s5,
+		   sum(a * b + a)::text      AS s6,
+		   sum(d * e)::text          AS s7,
+		   sum(a * b * a)::text      AS s8
+	FROM t_mul GROUP BY grp;
+RESET pg_prosupport.enabled;
+
+SELECT count(*) AS mul_mismatches
+FROM t_mulref r
+FULL JOIN (
+	SELECT grp,
+		   sum(a * b)::text          AS s1,
+		   avg(a * b)::text          AS s2,
+		   sum((a + 1) * b)::text    AS s3,
+		   sum(a * 1.2)::text        AS s4,
+		   sum(round(a, 1) * b)::text AS s5,
+		   sum(a * b + a)::text      AS s6,
+		   sum(d * e)::text          AS s7,
+		   sum(a * b * a)::text      AS s8
+	FROM t_mul GROUP BY grp) x USING (grp)
+WHERE (r.s1, r.s2, r.s3, r.s4, r.s5, r.s6, r.s7, r.s8)
+	  IS DISTINCT FROM (x.s1, x.s2, x.s3, x.s4, x.s5, x.s6, x.s7, x.s8);
+
+SELECT grp, sum(a * b), avg(a * b) FROM t_mul GROUP BY grp ORDER BY grp;
+
+-- parallel, where the folded state also crosses the worker boundary
+SET max_parallel_workers_per_gather = 0;
+SELECT sum(a * b)::text AS mulseq FROM t_mul \gset
+SET max_parallel_workers_per_gather = 4;
+SET parallel_setup_cost = 0;
+SET parallel_tuple_cost = 0;
+SET min_parallel_table_scan_size = 0;
+SELECT sum(a * b)::text = :'mulseq' AS mul_parallel_matches_serial FROM t_mul;
+RESET max_parallel_workers_per_gather;
+RESET parallel_setup_cost;
+RESET parallel_tuple_cost;
+RESET min_parallel_table_scan_size;
+
+--
+-- Special values in a product.  A numeric(p,s) column cannot hold an infinity,
+-- so these are only reachable by calling the aggregate directly -- but the
+-- rules of numeric_mul() have to be reproduced exactly all the same, because
+-- no numeric_mul() call happens any more.
+--
+SELECT numeric_scaled_sum_mul(x, y, 2, 2)
+  FROM (VALUES ('Infinity'::numeric, 2.00)) t(x, y);
+SELECT numeric_scaled_sum_mul(x, y, 2, 2)
+  FROM (VALUES ('Infinity'::numeric, -2.00)) t(x, y);
+SELECT numeric_scaled_sum_mul(x, y, 2, 2)
+  FROM (VALUES ('Infinity'::numeric, 0.00)) t(x, y);
+SELECT numeric_scaled_sum_mul(x, y, 2, 2)
+  FROM (VALUES ('-Infinity'::numeric, '-Infinity'::numeric)) t(x, y);
+SELECT numeric_scaled_sum_mul(x, y, 2, 2)
+  FROM (VALUES ('-Infinity'::numeric, 'Infinity'::numeric)) t(x, y);
+SELECT numeric_scaled_sum_mul(x, y, 2, 2)
+  FROM (VALUES ('NaN'::numeric, 'Infinity'::numeric)) t(x, y);
+SELECT numeric_scaled_sum_mul(x, y, 2, 2)
+  FROM (VALUES (NULL::numeric, 2.00)) t(x, y);
+-- a factor that does not honour the scale it was specialised on
+SELECT numeric_scaled_sum_mul(x, y, 2, 2)
+  FROM (VALUES (1.234::numeric, 2.00)) t(x, y);
+SELECT numeric_scaled_sum_mul(x, y, 2, 2)
+  FROM (VALUES (1e20::numeric, 2.00)) t(x, y);
+
+-- and the values have to match core exactly, dscale included
+INSERT INTO t_ab VALUES (1.25, 3.1234, 7.0123456789),
+						(-0.10, 0.0001, -1.0000000001),
+						(99999999.99, 99999999.9999, 1234567890.0123456789);
+
+SET pg_prosupport.enabled = off;
+SELECT sum(a * b)::text AS r1, sum(a + b)::text AS r2, sum(a - b)::text AS r3,
+	   sum(-a)::text AS r4, sum(a * b + a)::text AS r5,
+	   sum(a * 1.2)::text AS r6, sum(a - 1)::text AS r7,
+	   sum(a * 0.05)::text AS r8,
+	   sum(a * c::numeric(14,4))::text AS r9,
+	   sum(round(a * b, 2))::text AS r10,
+	   sum(trunc(a * b, 2))::text AS r11,
+	   sum(round(a * b))::text AS r12,
+	   sum(round(a, -1))::text AS r13 FROM t_ab \gset
+RESET pg_prosupport.enabled;
+
+SELECT sum(a * b)::text = :'r1' AS mul,
+	   sum(a + b)::text = :'r2' AS add,
+	   sum(a - b)::text = :'r3' AS sub,
+	   sum(-a)::text = :'r4' AS neg,
+	   sum(a * b + a)::text = :'r5' AS nested,
+	   sum(a * 1.2)::text = :'r6' AS const_mul,
+	   sum(a - 1)::text = :'r7' AS const_sub,
+	   sum(a * 0.05)::text = :'r8' AS const_small
+FROM t_ab;
+
+SELECT sum(a * c::numeric(14,4))::text = :'r9' AS cast_mul,
+	   sum(round(a * b, 2))::text = :'r10' AS rounded,
+	   sum(trunc(a * b, 2))::text = :'r11' AS truncated,
+	   sum(round(a * b))::text = :'r12' AS rounded0,
+	   sum(round(a, -1))::text = :'r13' AS rounded_neg
+FROM t_ab;
+
+-- Rounding that carries into an extra integer digit: round(9.99, 1) is 10.0,
+-- which is why the derived precision allows for one more digit than the
+-- operand has.
+SELECT sum(round(v, 1))::text FROM (VALUES ('9.99'::numeric(3,2))) x(v);
+
+-- A plpgsql variable does carry a typmod, unlike a PREPARE parameter, and
+-- plpgsql coerces on assignment, so the promise holds.
+CREATE FUNCTION pps_plpgsql_probe() RETURNS numeric LANGUAGE plpgsql AS $$
+DECLARE
+	x numeric(10,2) := 1.005;
+BEGIN
+	RETURN (SELECT sum(y) FROM (VALUES (x), (x)) t(y));
+END
+$$;
+SELECT pps_plpgsql_probe();
+DROP FUNCTION pps_plpgsql_probe();
+
+--
+-- avg().  It shares the transition function with sum() and differs only in the
+-- final function, exactly as core shares numeric_avg_accum.
+--
+EXPLAIN (verbose, costs off) SELECT avg(v) FROM t_ok;
+EXPLAIN (verbose, costs off) SELECT avg(a * b) FROM t_ab;
+EXPLAIN (verbose, costs off) SELECT avg(v) FROM t_w29;
+
+-- DISTINCT, ORDER BY and FILTER change the semantics of accumulation
+EXPLAIN (verbose, costs off) SELECT sum(DISTINCT v) FROM t_ok;
+EXPLAIN (verbose, costs off) SELECT sum(v ORDER BY v) FROM t_ok;
+EXPLAIN (verbose, costs off) SELECT sum(v) FILTER (WHERE v > 0) FROM t_ok;
+-- the off switch
+SET pg_prosupport.enabled = off;
+EXPLAIN (verbose, costs off) SELECT sum(v) FROM t_ok;
+RESET pg_prosupport.enabled;
+
+--
+-- Values: the substituted aggregate has to match the stock one in everything,
+-- including the result's dscale and the ordering of special values.
+--
+INSERT INTO t_ok VALUES (1.00), (2.50), (-0.75), (0.01), (1000000000000000.00);
+
+SELECT sum(v) FROM t_ok;
+SELECT sum(v) FROM t_ok WHERE false;
+SELECT sum(v) FROM (VALUES (NULL::numeric(18,2))) x(v);
+SELECT sum(v) FROM (VALUES (1.00::numeric(18,2)), (NULL)) x(v);
+
+-- the result's scale must not depend on the values
+SELECT sum(v), pg_typeof(sum(v)) FROM (VALUES (1.00::numeric(18,2))) x(v);
+SELECT sum(v) FROM (VALUES (0.00::numeric(18,2))) x(v);
+SELECT sum(v) FROM (VALUES (0::numeric(18,0))) x(v);
+
+-- precision boundaries: eighteen nines at s = 0 and at s = 2
+SELECT sum(v) FROM (VALUES ('999999999999999999'::numeric(18,0))) x(v);
+SELECT sum(v) FROM (VALUES ('9999999999999999.99'::numeric(18,2))) x(v);
+SELECT sum(v) FROM (VALUES ('0.999999999999999999'::numeric(18,18))) x(v);
+SELECT sum(v) FROM (VALUES ('-9999999999999999.99'::numeric(18,2)),
+						   ('-9999999999999999.99')) x(v);
+
+-- the sum stops fitting in an int64: the general path that assembles the
+-- result from three eighteen-digit parts takes over
+SELECT sum(v) FROM (SELECT '9999999999999999.99'::numeric(18,2)
+					FROM generate_series(1, 20)) x(v);
+
+--
+-- 19 <= p <= 28: each individual mantissa is already too wide for an int64,
+-- so this is what exercises the wide digits.
+--
+SELECT sum(v) FROM (VALUES ('12345678901234567.89'::numeric(19,2))) x(v);
+SELECT sum(v) FROM (VALUES ('99999999999999999.99'::numeric(19,2)),
+						   ('99999999999999999.99')) x(v);
+-- precision boundaries at p = 28
+SELECT sum(v) FROM (VALUES ('99999999.99999999999999999999'::numeric(28,20))) x(v);
+SELECT sum(v) FROM (VALUES ('-99999999.99999999999999999999'::numeric(28,20)),
+						   ('0.00000000000000000001')) x(v);
+SELECT sum(v) FROM (VALUES ('9999999999999999999999999999'::numeric(28,0))) x(v);
+-- the result's scale, and zeroes
+SELECT sum(v) FROM (VALUES ('0.00'::numeric(19,2))) x(v);
+SELECT sum(v) FROM (VALUES ('1.00'::numeric(19,2)), (NULL)) x(v);
+SELECT sum(v) FROM (VALUES ('NaN'::numeric(19,2)), ('1.00')) x(v);
+-- a sum landing well outside int64
+SELECT sum(v) FROM (SELECT '99999999999999999.99'::numeric(19,2)
+					FROM generate_series(1, 1000)) x(v);
+
+-- Special values.  A numeric(18,2) column holds NaN but not the infinities:
+-- apply_typmod() rejects those.  So +-Infinity cannot reach the substituted
+-- aggregate at all, and the infinity counters are exercised by calling it
+-- directly.
+SELECT sum(v) FROM (VALUES ('NaN'::numeric(18,2)), (1.00)) x(v);
+SELECT sum(v) FROM (VALUES ('NaN'::numeric(18,2)), (NULL)) x(v);
+SELECT 'Infinity'::numeric(18,2);
+
+SELECT numeric_scaled_sum(v, 2)
+  FROM (VALUES ('Infinity'::numeric), (1.00)) x(v);
+SELECT numeric_scaled_sum(v, 2)
+  FROM (VALUES ('-Infinity'::numeric), (1.00)) x(v);
+SELECT numeric_scaled_sum(v, 2)
+  FROM (VALUES ('Infinity'::numeric), ('-Infinity')) x(v);
+SELECT numeric_scaled_sum(v, 2)
+  FROM (VALUES ('NaN'::numeric), ('Infinity')) x(v);
+
+--
+-- Differential check against core on wider data.  The reference is computed
+-- with the switch off -- that is, by the real pg_catalog.sum -- stored in a
+-- table and compared with the substituted result.  The comparison is on text
+-- rather than on the value: numeric_eq considers 1.0 and 1.00 equal, and we
+-- also want to catch a dscale mismatch, which would later throw off avg().
+--
+CREATE TABLE t_bulk (grp int, v numeric(18,4), w numeric(26,10));
+INSERT INTO t_bulk
+  SELECT i % 97,
+		 ((i * 7919) % 1000000)::numeric / 10000,
+		 ((i * 104729)::numeric * 1000000007) / 10000000000
+  FROM generate_series(1, 20000) i;
+
+SET pg_prosupport.enabled = off;
+CREATE TABLE t_ref AS
+  SELECT grp, sum(v) AS s, sum(w) AS sw FROM t_bulk GROUP BY grp;
+RESET pg_prosupport.enabled;
+
+SELECT count(*) AS mismatches
+FROM t_ref r
+FULL JOIN (SELECT grp, sum(v) AS s, sum(w) AS sw FROM t_bulk GROUP BY grp) a
+	  USING (grp)
+WHERE r.s::text IS DISTINCT FROM a.s::text
+   OR r.sw::text IS DISTINCT FROM a.sw::text;
+
+-- and the same for the sum over the whole table
+SET pg_prosupport.enabled = off;
+SELECT sum(v)::text AS ref FROM t_bulk \gset
+RESET pg_prosupport.enabled;
+SELECT sum(v)::text = :'ref' AS matches_stock FROM t_bulk;
+
+-- avg() over the same data, grouped and ungrouped: the quotient's scale comes
+-- out of select_div_scale(), so a dscale mismatch in our sum would show here
+SET pg_prosupport.enabled = off;
+CREATE TABLE t_avgref AS
+  SELECT grp, avg(v) AS a, avg(w) AS aw FROM t_bulk GROUP BY grp;
+SELECT avg(v)::text AS avgref FROM t_bulk \gset
+RESET pg_prosupport.enabled;
+
+SELECT count(*) AS avg_mismatches
+FROM t_avgref r
+FULL JOIN (SELECT grp, avg(v) AS a, avg(w) AS aw FROM t_bulk GROUP BY grp) x
+	  USING (grp)
+WHERE r.a::text IS DISTINCT FROM x.a::text
+   OR r.aw::text IS DISTINCT FROM x.aw::text;
+
+SELECT avg(v)::text = :'avgref' AS avg_matches_stock FROM t_bulk;
+SELECT avg(v) FROM t_bulk WHERE false;
+SELECT avg(v) FROM (VALUES ('NaN'::numeric(18,2)), (1.00)) x(v);
+SELECT avg(v) FROM (VALUES (NULL::numeric(18,2))) x(v);
+
+-- parallel avg: the combine and serialize functions are shared with sum(),
+-- but the final function is not
+SET max_parallel_workers_per_gather = 0;
+SELECT avg(v)::text AS avgseq FROM t_bulk \gset
+SET max_parallel_workers_per_gather = 4;
+SELECT avg(v)::text = :'avgseq' AS avg_parallel_matches_serial FROM t_bulk;
+
+-- parallel aggregation must give the same answer as the serial one
+SET max_parallel_workers_per_gather = 0;
+SELECT sum(v) FROM t_bulk \gset seq_
+SET max_parallel_workers_per_gather = 4;
+SET parallel_setup_cost = 0;
+SET parallel_tuple_cost = 0;
+SET min_parallel_table_scan_size = 0;
+SELECT sum(v) = :'seq_sum' AS parallel_matches_serial FROM t_bulk;
+
+--
+-- A sum that does not fit in an int64.  This is the only place where the
+-- 128-bit state is taken apart into halves (PG_INT128_HI_INT64 / make_int128),
+-- and shipping it from a worker to the leader puts it through both.  The mix
+-- of signs is needed to catch a sign-extension bug: with all-positive addends
+-- a broken make_int128 would produce the same answer.
+--
+CREATE TABLE t_big (v numeric(18,2));
+INSERT INTO t_big
+  SELECT CASE WHEN i % 3 = 0 THEN -9999999999999999.99
+              ELSE 9999999999999999.99 END
+  FROM generate_series(1, 100000) i;
+ANALYZE t_big;
+
+SET pg_prosupport.enabled = off;
+SELECT sum(v)::text AS bigref FROM t_big \gset
+RESET pg_prosupport.enabled;
+
+SELECT sum(v)::text = :'bigref' AS big_parallel_matches_stock FROM t_big;
+SET max_parallel_workers_per_gather = 0;
+SELECT sum(v)::text = :'bigref' AS big_serial_matches_stock FROM t_big;
+
+-- the same at p = 26: the mantissas are already beyond int64, the sum all the more
+SET max_parallel_workers_per_gather = 4;
+CREATE TABLE t_bigw (v numeric(26,10));
+INSERT INTO t_bigw
+  SELECT CASE WHEN i % 3 = 0 THEN -1234567890123456.7890123456
+			  ELSE 9876543210987654.3210987654 END
+  FROM generate_series(1, 100000) i;
+ANALYZE t_bigw;
+
+SET pg_prosupport.enabled = off;
+SELECT sum(v)::text AS bigwref FROM t_bigw \gset
+RESET pg_prosupport.enabled;
+
+SELECT sum(v)::text = :'bigwref' AS wide_parallel_matches_stock FROM t_bigw;
+SET max_parallel_workers_per_gather = 0;
+SELECT sum(v)::text = :'bigwref' AS wide_serial_matches_stock FROM t_bigw;
+
+RESET max_parallel_workers_per_gather;
+RESET parallel_setup_cost;
+RESET parallel_tuple_cost;
+RESET min_parallel_table_scan_size;
+
+--
+-- A broken contract.  Calling the aggregate directly with a scale the value
+-- does not conform to has to raise an error rather than round quietly.
+--
+SELECT numeric_scaled_sum(v, 2) FROM (VALUES (1.234::numeric)) x(v);
+SELECT numeric_scaled_sum(v, 2) FROM (VALUES (1e26::numeric)) x(v);
+SELECT numeric_scaled_sum(v, 2) FROM (VALUES (1e30::numeric)) x(v);
+
+--
+-- The off switch has to reach a saved generic plan.  A GUC is not a source of
+-- plan invalidation by itself, so the assign hook flushes the plan cache; in a
+-- connection pool, where a generic plan can live for hours, those are exactly
+-- the sessions the switch was added for.
+--
+SET plan_cache_mode = force_generic_plan;
+PREPARE psum AS SELECT sum(v) FROM t_ok;
+EXPLAIN (verbose, costs off) EXECUTE psum;
+SET pg_prosupport.enabled = off;
+EXPLAIN (verbose, costs off) EXECUTE psum;
+RESET pg_prosupport.enabled;
+EXPLAIN (verbose, costs off) EXECUTE psum;
+
+DEALLOCATE psum;
+RESET plan_cache_mode;
+
+--
+-- Attached to an aggregate we do not know.  There must be no substitution, and
+-- the complaint must come once per backend: at planning time an unconditional
+-- WARNING would flood the log and the client.
+--
+UPDATE pg_proc SET prosupport = 'pps_agg_support'::regproc
+ WHERE oid = 'pg_catalog.max(numeric)'::regprocedure;
+EXPLAIN (verbose, costs off) SELECT max(v) FROM t_ok;
+EXPLAIN (verbose, costs off) SELECT max(v) FROM t_ok;
+SELECT max(v) FROM t_ok;
+UPDATE pg_proc SET prosupport = 0
+ WHERE oid = 'pg_catalog.max(numeric)'::regprocedure;
+
+--
+-- Detaching
+--
+UPDATE pg_proc SET prosupport = 0
+ WHERE oid IN ('pg_catalog.sum(numeric)'::regprocedure,
+			   'pg_catalog.avg(numeric)'::regprocedure);
+EXPLAIN (verbose, costs off) SELECT sum(v) FROM t_ok;
+EXPLAIN (verbose, costs off) SELECT avg(v) FROM t_ok;
+
+DROP TABLE t_ok, t_wide, t_w28, t_w29, t_plain, t_int0, t_frac, t_dom, t_dom2,
+		   t_bulk, t_ref, t_big, t_bigw, t_ab, t_avgref, t_mul, t_mulref;
+DROP DOMAIN money18_2;
+DROP DOMAIN money18;
+DROP EXTENSION pg_prosupport;

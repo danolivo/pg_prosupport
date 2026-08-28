@@ -53,3 +53,12 @@ dkms.conf
 
 # debug information files
 *.dwo
+
+# pg_regress leftovers
+/log/
+/results/
+/tmp_check/
+/regression.diffs
+
+# ... but the expected output is the test suite, not a build artefact.
+!expected/*.out
