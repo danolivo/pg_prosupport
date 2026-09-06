@@ -23,6 +23,7 @@ extern void pps_decline(Oid aggfnoid, const char *reason);
 
 /* numeric_support.c */
 extern void pps_syscache_reset(Datum arg, int cacheid, uint32 hashvalue);
+extern Node *pps_simplify_aggref(Aggref *agg, Oid supportfnoid);
 
 /* constagg.c */
 extern bool pps_fold_const_sum;

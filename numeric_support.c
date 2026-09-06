@@ -544,6 +544,190 @@ pps_scale_const(int value, AttrNumber resno)
 	return makeTargetEntry((Expr *) con, resno, NULL, false);
 }
 
+/*
+ * pps_simplify_aggref
+ *		The whole rewrite, with no dependency on the support-function protocol.
+ *
+ * Returns the replacement node, or NULL to leave the aggregate alone.  The
+ * caller passes the OID of the function this code is reached through --
+ * pps_load_oids() needs it to find the extension's own schema.
+ *
+ * This lives apart from pps_agg_support() so that a fork without
+ * SupportRequestSimplifyAggref can call the rewrite from wherever it does have
+ * an Aggref in hand.
+ */
+Node *
+pps_simplify_aggref(Aggref *agg, Oid supportfnoid)
+{
+	TargetEntry *tle;
+	Node	   *lhs;
+	Node	   *rhs;
+	int			p,
+				s,
+				s1,
+				s2;
+	Oid			newfn;
+	Aggref	   *newagg;
+	Node	   *folded;
+	bool		is_sum;
+	bool		scaled_ok;
+
+	if (!pps_enabled)
+	{
+		pps_decline(agg->aggfnoid,
+					"pg_prosupport.enabled is off");
+		return NULL;
+	}
+
+	/*
+	 * pps_load_oids() prints its own reason when the specialised aggregates
+	 * cannot be found.  That is no longer a reason to give up immediately: the
+	 * constant-argument rewrite below does not need them, so the answer is
+	 * remembered and acted on only where it matters.
+	 */
+	scaled_ok = pps_load_oids(supportfnoid);
+
+	/*
+	 * Which aggregate were we attached to?  The binding lives in an ALTER
+	 * FUNCTION, that is outside this code, so a support function attached to
+	 * something we do not know how to rewrite would otherwise be free to
+	 * produce nonsense.  Here it costs two comparisons.
+	 */
+	if (agg->aggfnoid == pps_sum_numeric_oid)
+	{
+		is_sum = true;
+		newfn = pps_scaled_sum_oid;
+	}
+	else if (agg->aggfnoid == pps_avg_numeric_oid)
+	{
+		is_sum = false;
+		newfn = pps_scaled_avg_oid;
+	}
+	else
+	{
+		/*
+		 * Complain once per backend rather than once per Aggref.  This is
+		 * planning: an unconditional WARNING on a hot query would flood both
+		 * the log and the client, and would do so precisely when something
+		 * else in the log needs to be found.  The flag is cleared along with
+		 * the OID cache, so a binding that is fixed and then broken again will
+		 * speak up.
+		 */
+		if (!pps_warned_wrong_aggregate)
+		{
+			pps_warned_wrong_aggregate = true;
+			ereport(WARNING,
+					(errmsg("pg_prosupport support function is attached to aggregate %u",
+							agg->aggfnoid),
+					 errdetail("This support function only knows how to rewrite pg_catalog.sum(numeric) and pg_catalog.avg(numeric); the aggregate is left alone."),
+					 errhint("Detach it by setting that aggregate's pg_proc.prosupport back to 0.")));
+		}
+		return NULL;
+	}
+
+	/*
+	 * A constant argument is the one case where the aggregation does not have
+	 * to happen at all, so it is tried before any specialisation.  constagg.c
+	 * owns that transformation, its conditions and its switch, and returns
+	 * NULL whenever it does not apply.
+	 */
+	if (is_sum)
+	{
+		folded = pps_simplify_const_sum(agg);
+
+		if (folded != NULL)
+			return folded;
+	}
+
+	/* everything below replaces the aggregate with one of ours */
+	if (!scaled_ok)
+		return NULL;
+
+	/*
+	 * The conditions under which we fire.  Each one declines rather than tries
+	 * to work around the problem: the price of a mistake here is a silently
+	 * wrong sum, not a slow query.
+	 *
+	 * aggsplit is not tested: SupportRequestSimplifyAggref arrives during
+	 * preprocessing, before the planner splits the aggregate, so it is always
+	 * AGGSPLIT_SIMPLE here.  Partial aggregation is in fact supported --
+	 * through combinefunc -- and a test for it would mislead the reader.
+	 */
+	Assert(agg->aggsplit == AGGSPLIT_SIMPLE);
+
+	if (agg->aggdistinct != NIL || agg->aggorder != NIL ||
+		agg->aggfilter != NULL || agg->aggvariadic ||
+		agg->agglevelsup != 0)
+	{
+		pps_decline(agg->aggfnoid,
+					"DISTINCT, ORDER BY, FILTER, VARIADIC or an outer "
+					"reference is present");
+		return NULL;
+	}
+
+	if (list_length(agg->args) != 1)
+	{
+		pps_decline(agg->aggfnoid,
+					"aggregate does not have exactly one argument");
+		return NULL;
+	}
+
+	tle = (TargetEntry *) linitial(agg->args);
+
+	/*
+	 * First choice: the argument is a product we can take apart, in which case
+	 * the multiplication is folded into the transition function and no
+	 * intermediate numeric is ever built.  Falling back to the ordinary form
+	 * when it is not still specialises the accumulation.
+	 */
+	if (pps_split_product((Node *) tle->expr, &lhs, &rhs, &s1, &s2))
+	{
+		newfn = (newfn == pps_scaled_sum_oid) ? pps_scaled_sum_mul_oid
+			: pps_scaled_avg_mul_oid;
+
+		newagg = copyObject(agg);
+		newagg->aggfnoid = newfn;
+		newagg->args = list_make4(makeTargetEntry((Expr *) copyObject(lhs),
+												  1, NULL, false),
+								  makeTargetEntry((Expr *) copyObject(rhs),
+												  2, NULL, false),
+								  pps_scale_const(s1, 3),
+								  pps_scale_const(s2, 4));
+		newagg->aggargtypes = list_make4_oid(NUMERICOID, NUMERICOID,
+											 INT4OID, INT4OID);
+
+		return (Node *) newagg;
+	}
+
+	/*
+	 * pps_derive_bounds() enforces the range as it goes -- at p <= 28 the
+	 * mantissa is below 10^28 ~ 2^93 and the int128 accumulator holds ~1.7e10
+	 * addends -- so there is nothing left to check here.  A negative scale
+	 * (possible since PG15) is rejected there too, or a -2 would end up in
+	 * 10^s and break everything quietly.
+	 */
+	if (!pps_derive_bounds((Node *) tle->expr, 0, &p, &s))
+	{
+		pps_decline(agg->aggfnoid,
+					"could not derive a precision and scale for the "
+					"argument within the supported range");
+		return NULL;
+	}
+
+	Assert(p >= 1 && p <= PPS_MAX_PRECISION && s >= 0 && s <= p);
+
+	/*
+	 * Build a copy rather than editing the node in place: the comment on
+	 * SupportRequestSimplifyAggref requires it.
+	 */
+	newagg = copyObject(agg);
+	newagg->aggfnoid = newfn;
+	newagg->args = lappend(newagg->args, pps_scale_const(s, 2));
+	newagg->aggargtypes = lappend_oid(newagg->aggargtypes, INT4OID);
+
+	return (Node *) newagg;
+}
+
 Datum
 pps_agg_support(PG_FUNCTION_ARGS)
 {
@@ -552,178 +736,11 @@ pps_agg_support(PG_FUNCTION_ARGS)
 	if (IsA(rawreq, SupportRequestSimplifyAggref))
 	{
 		SupportRequestSimplifyAggref *req;
-		Aggref	   *agg;
-		TargetEntry *tle;
-		Node	   *lhs;
-		Node	   *rhs;
-		int			p,
-					s,
-					s1,
-					s2;
-		Oid			newfn;
-		Aggref	   *newagg;
-		Node	   *folded;
-		bool		is_sum;
-		bool		scaled_ok;
 
 		req = (SupportRequestSimplifyAggref *) rawreq;
-		agg = req->aggref;
 
-		if (!pps_enabled)
-		{
-			pps_decline(agg->aggfnoid,
-						"pg_prosupport.enabled is off");
-			PG_RETURN_POINTER(NULL);
-		}
-
-		/*
-		 * pps_load_oids() prints its own reason when the specialised
-		 * aggregates cannot be found.  That is no longer a reason to give up
-		 * immediately: the constant-argument rewrite below does not need them,
-		 * so the answer is remembered and acted on only where it matters.
-		 */
-		scaled_ok = pps_load_oids(fcinfo->flinfo->fn_oid);
-
-		/*
-		 * Which aggregate were we attached to?  The binding lives in an ALTER
-		 * FUNCTION, that is outside this code, so a support function attached
-		 * to something we do not know how to rewrite would otherwise be free
-		 * to produce nonsense.  Here it costs two comparisons.
-		 */
-		if (agg->aggfnoid == pps_sum_numeric_oid)
-		{
-			is_sum = true;
-			newfn = pps_scaled_sum_oid;
-		}
-		else if (agg->aggfnoid == pps_avg_numeric_oid)
-		{
-			is_sum = false;
-			newfn = pps_scaled_avg_oid;
-		}
-		else
-		{
-			/*
-			 * Complain once per backend rather than once per Aggref.  This is
-			 * planning: an unconditional WARNING on a hot query would flood
-			 * both the log and the client, and would do so precisely when
-			 * something else in the log needs to be found.  The flag is
-			 * cleared along with the OID cache, so a binding that is fixed and
-			 * then broken again will speak up.
-			 */
-			if (!pps_warned_wrong_aggregate)
-			{
-				pps_warned_wrong_aggregate = true;
-				ereport(WARNING,
-						(errmsg("pg_prosupport support function is attached to aggregate %u",
-								agg->aggfnoid),
-						 errdetail("This support function only knows how to rewrite pg_catalog.sum(numeric) and pg_catalog.avg(numeric); the aggregate is left alone."),
-						 errhint("Detach it by setting that aggregate's pg_proc.prosupport back to 0.")));
-			}
-			PG_RETURN_POINTER(NULL);
-		}
-
-		/*
-		 * A constant argument is the one case where the aggregation does not
-		 * have to happen at all, so it is tried before any specialisation.
-		 * constagg.c owns that transformation, its conditions and its switch,
-		 * and returns NULL whenever it does not apply.
-		 */
-		if (is_sum)
-		{
-			folded = pps_simplify_const_sum(agg);
-
-			if (folded != NULL)
-				PG_RETURN_POINTER(folded);
-		}
-
-		/* everything below replaces the aggregate with one of ours */
-		if (!scaled_ok)
-			PG_RETURN_POINTER(NULL);
-
-		/*
-		 * The conditions under which we fire.  Each one declines rather than
-		 * tries to work around the problem: the price of a mistake here is a
-		 * silently wrong sum, not a slow query.
-		 *
-		 * aggsplit is not tested: SupportRequestSimplifyAggref arrives during
-		 * preprocessing, before the planner splits the aggregate, so it is
-		 * always AGGSPLIT_SIMPLE here.  Partial aggregation is in fact
-		 * supported -- through combinefunc -- and a test for it would mislead
-		 * the reader.
-		 */
-		Assert(agg->aggsplit == AGGSPLIT_SIMPLE);
-
-		if (agg->aggdistinct != NIL || agg->aggorder != NIL ||
-			agg->aggfilter != NULL || agg->aggvariadic ||
-			agg->agglevelsup != 0)
-		{
-			pps_decline(agg->aggfnoid,
-						"DISTINCT, ORDER BY, FILTER, VARIADIC or an outer "
-						"reference is present");
-			PG_RETURN_POINTER(NULL);
-		}
-
-		if (list_length(agg->args) != 1)
-		{
-			pps_decline(agg->aggfnoid,
-						"aggregate does not have exactly one argument");
-			PG_RETURN_POINTER(NULL);
-		}
-
-		tle = (TargetEntry *) linitial(agg->args);
-
-		/*
-		 * First choice: the argument is a product we can take apart, in which
-		 * case the multiplication is folded into the transition function and
-		 * no intermediate numeric is ever built.  Falling back to the ordinary
-		 * form when it is not still specialises the accumulation.
-		 */
-		if (pps_split_product((Node *) tle->expr, &lhs, &rhs, &s1, &s2))
-		{
-			newfn = (newfn == pps_scaled_sum_oid) ? pps_scaled_sum_mul_oid
-				: pps_scaled_avg_mul_oid;
-
-			newagg = copyObject(agg);
-			newagg->aggfnoid = newfn;
-			newagg->args = list_make4(makeTargetEntry((Expr *) copyObject(lhs),
-													  1, NULL, false),
-									  makeTargetEntry((Expr *) copyObject(rhs),
-													  2, NULL, false),
-									  pps_scale_const(s1, 3),
-									  pps_scale_const(s2, 4));
-			newagg->aggargtypes = list_make4_oid(NUMERICOID, NUMERICOID,
-												 INT4OID, INT4OID);
-
-			PG_RETURN_POINTER(newagg);
-		}
-
-		/*
-		 * pps_derive_bounds() enforces the range as it goes -- at p <= 28 the
-		 * mantissa is below 10^28 ~ 2^93 and the int128 accumulator holds
-		 * ~1.7e10 addends -- so there is nothing left to check here.  A
-		 * negative scale (possible since PG15) is rejected there too, or a -2
-		 * would end up in 10^s and break everything quietly.
-		 */
-		if (!pps_derive_bounds((Node *) tle->expr, 0, &p, &s))
-		{
-			pps_decline(agg->aggfnoid,
-						"could not derive a precision and scale for the "
-						"argument within the supported range");
-			PG_RETURN_POINTER(NULL);
-		}
-
-		Assert(p >= 1 && p <= PPS_MAX_PRECISION && s >= 0 && s <= p);
-
-		/*
-		 * Build a copy rather than editing the node in place: the comment on
-		 * SupportRequestSimplifyAggref requires it.
-		 */
-		newagg = copyObject(agg);
-		newagg->aggfnoid = newfn;
-		newagg->args = lappend(newagg->args, pps_scale_const(s, 2));
-		newagg->aggargtypes = lappend_oid(newagg->aggargtypes, INT4OID);
-
-		PG_RETURN_POINTER(newagg);
+		PG_RETURN_POINTER(pps_simplify_aggref(req->aggref,
+											  fcinfo->flinfo->fn_oid));
 	}
 
 	PG_RETURN_POINTER(NULL);
