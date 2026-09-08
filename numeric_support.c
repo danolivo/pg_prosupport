@@ -728,16 +728,14 @@ pps_agg_support(PG_FUNCTION_ARGS)
 
 	if (IsA(rawreq, SupportRequestSimplifyAggref))
 	{
-		SupportRequestSimplifyAggref *req;
+		SupportRequestSimplifyAggref *req = (SupportRequestSimplifyAggref *) rawreq;
 
 		if (!pps_enabled)
 		{
-			pps_decline(agg->aggfnoid,
+			pps_decline(req->aggref->aggfnoid,
 						"pg_prosupport.enabled is off");
-			return NULL;
+			PG_RETURN_POINTER(NULL);
 		}
-
-		req = (SupportRequestSimplifyAggref *) rawreq;
 
 		PG_RETURN_POINTER(pps_simplify_aggref(req->aggref,
 											  fcinfo->flinfo->fn_oid));

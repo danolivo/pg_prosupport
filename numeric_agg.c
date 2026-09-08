@@ -260,6 +260,154 @@ pps_int128_neg(INT128 *i128)
 }
 
 /*
+ * PG_INT128_HI_INT64 / PG_INT128_LO_UINT64
+ *		The high and low 64-bit halves of an INT128, in the same layout
+ *		common/int128.h uses for its emulated struct.  Neither accessor is
+ *		exposed by that header -- it only ever hands out whole INT128
+ *		values -- but pps_scaled_serialize()/pps_scaled_deserialize() have to
+ *		ship the two halves separately down the wire, and
+ *		pps_int128_fits_int64() below has to look at them individually to
+ *		test for sign extension.
+ */
+static inline int64
+PG_INT128_HI_INT64(INT128 v)
+{
+#if USE_NATIVE_INT128
+	return (int64) (((uint128) v) >> 64);
+#else
+	return v.hi;
+#endif
+}
+
+static inline uint64
+PG_INT128_LO_UINT64(INT128 v)
+{
+#if USE_NATIVE_INT128
+	return (uint64) v;
+#else
+	return v.lo;
+#endif
+}
+
+/*
+ * make_int128
+ *		The inverse of the two accessors above: rebuild an INT128 from its
+ *		halves, the way pps_scaled_deserialize() needs after reading them
+ *		back separately.
+ */
+static inline INT128
+make_int128(int64 hi, uint64 lo)
+{
+#if USE_NATIVE_INT128
+	return (((INT128) hi) << 64) | (INT128) lo;
+#else
+	INT128		v;
+
+	v.hi = hi;
+	v.lo = lo;
+	return v;
+#endif
+}
+
+/*
+ * int128_add_int128
+ *		*i128 += addend.
+ *
+ * common/int128.h has no such helper: every core caller only ever adds a
+ * bare int64 or an int64*int64 product into an accumulator.
+ * pps_scaled_accum() and pps_scaled_combine() are the exception, merging one
+ * full 128-bit accumulator into another, so it is provided here in the same
+ * style as pps_int128_mul_add() and pps_int128_neg() above.
+ */
+static inline void
+int128_add_int128(INT128 *i128, INT128 addend)
+{
+#if USE_NATIVE_INT128
+	*i128 += addend;
+#else
+	/*
+	 * Add the unsigned low half through int128_add_uint64(), which already
+	 * propagates the carry into the high half correctly, then add the high
+	 * half on top.  That is exactly addend.hi * 2^64 + addend.lo added to
+	 * *i128, which is what addend equals under two's complement.
+	 */
+	int128_add_uint64(i128, addend.lo);
+	i128->hi += addend.hi;
+#endif
+}
+
+/*
+ * int128_div_mod_int32
+ *		*i128 /= divisor, truncating toward zero; *remainder is set to the
+ *		truncating remainder, which takes the sign of the original *i128.
+ *
+ * divisor must be a positive int32 well below 2^31 -- the only caller,
+ * pps_int128_to_numeric(), only ever passes 1000000000 -- so the emulated
+ * path below does not have to worry about a negative or overflowing
+ * divisor.
+ */
+static inline void
+int128_div_mod_int32(INT128 *i128, int32 divisor, int32 *remainder)
+{
+#if USE_NATIVE_INT128
+	INT128		q;
+	INT128		r;
+
+	Assert(divisor > 0);
+
+	q = *i128 / divisor;
+	r = *i128 % divisor;
+
+	*i128 = q;
+	*remainder = (int32) r;
+#else
+	bool		neg;
+	uint32		word[4];
+	uint32		quot[4];
+	uint64		rem = 0;
+	int			i;
+
+	Assert(divisor > 0);
+
+	/*
+	 * Schoolbook long division by a one-word divisor, on the magnitude: take
+	 * the sign aside, negate if needed (pps_int128_neg() again, exactly as
+	 * above), split the 128-bit magnitude into four 32-bit words, and bring
+	 * them down into the running remainder one at a time.  "rem" never
+	 * reaches "divisor", which is below 2^31, so rem << 32 | word[i] fits
+	 * comfortably in a uint64 and each quotient word fits in a uint32.
+	 */
+	neg = (i128->hi < 0);
+	if (neg)
+		pps_int128_neg(i128);
+
+	word[0] = (uint32) (((uint64) i128->hi) >> 32);
+	word[1] = (uint32) (((uint64) i128->hi) & UINT64CONST(0xFFFFFFFF));
+	word[2] = (uint32) (i128->lo >> 32);
+	word[3] = (uint32) (i128->lo & UINT64CONST(0xFFFFFFFF));
+
+	for (i = 0; i < 4; i++)
+	{
+		uint64		cur = (rem << 32) | word[i];
+
+		quot[i] = (uint32) (cur / (uint32) divisor);
+		rem = cur % (uint32) divisor;
+	}
+
+	i128->hi = (int64) (((uint64) quot[0] << 32) | quot[1]);
+	i128->lo = ((uint64) quot[2] << 32) | quot[3];
+
+	if (neg)
+	{
+		pps_int128_neg(i128);
+		*remainder = -(int32) rem;
+	}
+	else
+		*remainder = (int32) rem;
+#endif
+}
+
+/*
  * pps_int128_fits_int64
  *		Does the value fit an int64, and if so what is it?
  *
@@ -963,13 +1111,13 @@ pps_int128_to_numeric(INT128 v, int scale)
 	res = int64_div_fast_to_numeric(part[0], scale);
 
 	if (part[1] != 0)
-		res = numeric_add_safe(res,
-							   int64_div_fast_to_numeric(part[1], scale - 18),
-							   NULL);
+		res = numeric_add_opt_error(res,
+									int64_div_fast_to_numeric(part[1], scale - 18),
+									NULL);
 	if (part[2] != 0)
-		res = numeric_add_safe(res,
-							   int64_div_fast_to_numeric(part[2], scale - 36),
-							   NULL);
+		res = numeric_add_opt_error(res,
+									int64_div_fast_to_numeric(part[2], scale - 36),
+									NULL);
 
 	return res;
 }
