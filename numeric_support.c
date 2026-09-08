@@ -572,13 +572,6 @@ pps_simplify_aggref(Aggref *agg, Oid supportfnoid)
 	bool		is_sum;
 	bool		scaled_ok;
 
-	if (!pps_enabled)
-	{
-		pps_decline(agg->aggfnoid,
-					"pg_prosupport.enabled is off");
-		return NULL;
-	}
-
 	/*
 	 * pps_load_oids() prints its own reason when the specialised aggregates
 	 * cannot be found.  That is no longer a reason to give up immediately: the
@@ -736,6 +729,13 @@ pps_agg_support(PG_FUNCTION_ARGS)
 	if (IsA(rawreq, SupportRequestSimplifyAggref))
 	{
 		SupportRequestSimplifyAggref *req;
+
+		if (!pps_enabled)
+		{
+			pps_decline(agg->aggfnoid,
+						"pg_prosupport.enabled is off");
+			return NULL;
+		}
 
 		req = (SupportRequestSimplifyAggref *) rawreq;
 
