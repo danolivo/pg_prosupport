@@ -1,0 +1,178 @@
+From: pg_prosupport
+Subject: Backport the SupportRequestSimplifyAggref planner hook to PG18
+
+pg_prosupport's aggregate rewrites (numeric_support.c, constagg.c) are
+reached through a pg_proc.prosupport function attached directly to
+sum(numeric)/avg(numeric), and invoked by the planner exactly the way
+an ordinary function's prosupport is invoked -- except that the call
+site for *aggregates* does not exist before PostgreSQL 19.
+
+PostgreSQL 19 added it in commit 42473b3b31 (David Rowley, "Have the
+planner replace COUNT(ANY) with COUNT(*)"), which introduced:
+
+  - SupportRequestSimplifyAggref, a new request struct in
+    src/include/nodes/supportnodes.h;
+  - a T_Aggref case in eval_const_expressions_mutator() together with
+    a new simplify_aggref() subroutine in
+    src/backend/optimizer/util/clauses.c, which looks up the
+    aggregate's prosupport function via get_func_support() and calls
+    it with a SupportRequestSimplifyAggref, exactly as
+    simplify_function() already does for plain functions with
+    SupportRequestSimplify.
+
+That commit also added a built-in COUNT(ANY) -> COUNT(*) support
+function to int8.c, and a signature change to expr_is_nonnullable()
+that COUNT(*) support function needs. Neither is included here:
+pg_prosupport does not use them, and leaving them out keeps this patch
+to the one thing it needs to be -- the generic extensibility point --
+with no effect on any core aggregate's plan on a stock PG18. (All 231
+tests in `make check` under src/test/regress pass unchanged against a
+tree with this patch applied, and aggregates.out in particular is
+untouched: no core aggregate has prosupport set by default, so
+get_func_support() returns InvalidOid for every Aggref in every
+existing test, and simplify_aggref() is a pure pass-through.)
+
+The new struct is pinned to nodetag_number(480) so that it lands as a
+pure addition after PG18's last auto-assigned node tag (479,
+WindowObjectData) rather than shifting the numbering of any existing
+node type -- see gen_node_support.pl's $last_nodetag/$last_nodetag_no,
+which exist specifically to catch a stable branch accidentally
+renumbering nodes.
+
+Tested against PostgreSQL 18.6. Apply from the top of a PostgreSQL
+source tree with:
+
+    patch -p1 < contrib/pg_prosupport/patches/pg18-support-request-simplify-aggref.patch
+
+or, inside a git checkout:
+
+    git apply contrib/pg_prosupport/patches/pg18-support-request-simplify-aggref.patch
+
+Then build PostgreSQL as usual and build/install pg_prosupport against
+that build; numeric_agg and const_agg (`make installcheck`) exercise
+the rewrite end to end.
+---
+diff --git a/src/backend/optimizer/util/clauses.c b/src/backend/optimizer/util/clauses.c
+index aa70667..6bf3c15 100644
+--- a/src/backend/optimizer/util/clauses.c
++++ b/src/backend/optimizer/util/clauses.c
+@@ -144,6 +144,8 @@ static Expr *simplify_function(Oid funcid,
+ 							   Oid result_collid, Oid input_collid, List **args_p,
+ 							   bool funcvariadic, bool process_args, bool allow_non_const,
+ 							   eval_const_expressions_context *context);
++static Node *simplify_aggref(Aggref *aggref,
++							 eval_const_expressions_context *context);
+ static List *reorder_function_arguments(List *args, int pronargs,
+ 										HeapTuple func_tuple);
+ static List *add_function_defaults(List *args, int pronargs,
+@@ -2647,6 +2649,9 @@ eval_const_expressions_mutator(Node *node,
+ 				newexpr->location = expr->location;
+ 				return (Node *) newexpr;
+ 			}
++		case T_Aggref:
++			node = ece_generic_processing(node);
++			return simplify_aggref((Aggref *) node, context);
+ 		case T_OpExpr:
+ 			{
+ 				OpExpr	   *expr = (OpExpr *) node;
+@@ -4064,6 +4069,55 @@ simplify_boolean_equality(Oid opno, List *args)
+ 	return NULL;
+ }
+
++/*
++ * simplify_aggref
++ *		Call the Aggref.aggfnoid's prosupport function, if it has one, to
++ *		allow it to determine if simplification of the Aggref is possible.
++ *		Returns the newly simplified node if conversion took place;
++ *		otherwise, returns the original Aggref.
++ *
++ * Backported from PostgreSQL 19 (commit 42473b3b31); see the comment on
++ * SupportRequestSimplifyAggref in supportnodes.h for further details.  Only
++ * the generic mechanism is carried over -- the built-in COUNT(ANY) ->
++ * COUNT(*) support function that same commit added to int8.c is not needed
++ * here and is not part of this backport; core aggregates keep whatever
++ * prosupport they already had (none, on a stock PG18) unless something
++ * else attaches one.
++ */
++static Node *
++simplify_aggref(Aggref *aggref, eval_const_expressions_context *context)
++{
++	Oid			prosupport = get_func_support(aggref->aggfnoid);
++
++	if (OidIsValid(prosupport))
++	{
++		SupportRequestSimplifyAggref req;
++		Node	   *newnode;
++
++		/*
++		 * Build a SupportRequestSimplifyAggref node to pass to the support
++		 * function.
++		 */
++		req.type = T_SupportRequestSimplifyAggref;
++		req.root = context->root;
++		req.aggref = aggref;
++
++		newnode = (Node *) DatumGetPointer(OidFunctionCall1(prosupport,
++															PointerGetDatum(&req)));
++
++		/*
++		 * We expect the support function to return either a new Node or
++		 * NULL (when simplification isn't possible).
++		 */
++		Assert(newnode != (Node *) aggref || newnode == NULL);
++
++		if (newnode != NULL)
++			return newnode;
++	}
++
++	return (Node *) aggref;
++}
++
+ /*
+  * Subroutine for eval_const_expressions: try to simplify a function call
+  * (which might originally have been an operator; we don't care)
+diff --git a/src/include/nodes/supportnodes.h b/src/include/nodes/supportnodes.h
+index 9c047cc..da9d12f 100644
+--- a/src/include/nodes/supportnodes.h
++++ b/src/include/nodes/supportnodes.h
+@@ -69,6 +69,40 @@ typedef struct SupportRequestSimplify
+ 	FuncExpr   *fcall;			/* Function call to be simplified */
+ } SupportRequestSimplify;
+
++/*
++ * Similar to SupportRequestSimplify, but for Aggref nodes rather than
++ * FuncExpr calls: the planner issues this to the aggregate's own
++ * pg_proc.prosupport function (an aggregate has no separate "function" of
++ * its own to attach a support function to, so it is attached to the
++ * aggregate's pg_proc row directly, via prosupport, exactly as for a plain
++ * function).
++ *
++ * Supporting functions can consult 'root' and the input 'aggref'.  When the
++ * implementing support function deems the simplification is possible, it
++ * must create a new Node (probably another Aggref) and not modify the
++ * original.  The newly created Node should then be returned to indicate
++ * that the conversion is to take place.  When no conversion is possible, a
++ * NULL pointer should be returned.
++ *
++ * It is important to consider that implementing support functions can
++ * receive Aggrefs with agglevelsup > 0.  Careful consideration should be
++ * given to whether the simplification is still possible at levels above 0.
++ *
++ * (Backported from PostgreSQL 19 commit 42473b3b31, which introduced this
++ * request type; only the request type and the planner's call to it are
++ * carried over here, not that commit's built-in COUNT(ANY) -> COUNT(*)
++ * support function.)
++ */
++typedef struct SupportRequestSimplifyAggref
++{
++	pg_node_attr(nodetag_number(480))
++
++	NodeTag		type;
++
++	struct PlannerInfo *root;	/* Planner's infrastructure */
++	Aggref	   *aggref;			/* Aggref to be simplified */
++} SupportRequestSimplifyAggref;
++
+ /*
+  * The Selectivity request allows the support function to provide a
+  * selectivity estimate for a function appearing at top level of a WHERE
