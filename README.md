@@ -8,7 +8,18 @@ server. `pg_proc.prosupport` of an aggregate is an ordinary catalog field, and
 `simplify_aggref()` hands whatever it points at a
 `SupportRequestSimplifyAggref` — the same mechanism that turns `COUNT(1)` into
 `COUNT(*)`. This extension is a home for rewrites reached that way. **No patched
-server is required.**
+server is required — from PostgreSQL 19.**
+
+`simplify_aggref()`'s call to `SupportRequestSimplifyAggref` is itself new in
+PostgreSQL 19 (commit `42473b3b31`). On PostgreSQL 18 the aggregate's
+`prosupport` field exists and can be set exactly as described below, but the
+planner never consults it, so nothing fires. `patches/` carries a small,
+tested backport of just that hook — no COUNT(1)/COUNT(*) support function,
+no other core behaviour change — for building a PG18 that pg_prosupport can
+attach to; see `patches/pg18-support-request-simplify-aggref.patch` for how
+to apply it. `numeric_agg`/`const_agg` (`make installcheck`) pass against a
+PG18 built with that patch, and PG18's own `make check` (231/231) is
+unaffected by it.
 
 Two of them so far, both aimed at what generated SQL — 1C, in the workload this
 came from — does to `sum(numeric)`:
