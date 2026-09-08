@@ -1,10 +1,8 @@
 CREATE EXTENSION pg_prosupport;
 
--- The support function is attached by writing pg_proc.prosupport; see the
--- README, and the header of numeric_agg.sql.
-UPDATE pg_proc SET prosupport = 'pps_agg_support'::regproc
- WHERE oid IN ('pg_catalog.sum(numeric)'::regprocedure,
-			   'pg_catalog.avg(numeric)'::regprocedure);
+-- The substitution happens through agg_simplify_hook; see the README, and
+-- the header of numeric_agg.sql.
+LOAD 'pg_prosupport';
 
 --
 -- sum() over a constant argument.  This one does not specialise the
@@ -145,10 +143,4 @@ RESET parallel_tuple_cost;
 RESET min_parallel_table_scan_size;
 
 DROP TABLE t_const, t_constref, t_empty;
--- Detach before dropping.  Nothing records the dependency, and a prosupport
--- pointing at a function that no longer exists breaks every sum(numeric) in
--- the database.
-UPDATE pg_proc SET prosupport = 0
- WHERE oid IN ('pg_catalog.sum(numeric)'::regprocedure,
-			   'pg_catalog.avg(numeric)'::regprocedure);
 DROP EXTENSION pg_prosupport;

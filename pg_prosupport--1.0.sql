@@ -20,8 +20,11 @@ CREATE FUNCTION pps_scaled_sum_final(internal) RETURNS numeric
   AS 'MODULE_PATHNAME', 'pps_scaled_sum_final' LANGUAGE C IMMUTABLE;
 CREATE FUNCTION pps_scaled_avg_final(internal) RETURNS numeric
   AS 'MODULE_PATHNAME', 'pps_scaled_avg_final' LANGUAGE C IMMUTABLE;
-CREATE FUNCTION pps_agg_support(internal) RETURNS internal
-  AS 'MODULE_PATHNAME', 'pps_agg_support' LANGUAGE C STRICT;
+
+-- No support function to create and attach here: the substitution is done by
+-- agg_simplify_hook, a global planner hook that _PG_init() installs when the
+-- library is loaded (shared_preload_libraries, session_preload_libraries, or
+-- LOAD) -- see the README and pg_prosupport.c.
 
 -- Two aggregates covering 1 <= p <= 28, differing only in the final function,
 -- exactly as core shares numeric_avg_accum between sum() and avg().  They are

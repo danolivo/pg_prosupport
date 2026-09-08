@@ -4,9 +4,12 @@
  *	  Plan-time substitution of specialised aggregates for sum(numeric) and
  *	  avg(numeric).
  *
- * A support function attached to the aggregate itself receives a
- * SupportRequestSimplifyAggref and, if the input can be shown to be narrow
- * enough, returns a new Aggref carrying a different aggfnoid.
+ * pg_prosupport.c installs pps_simplify_aggref() below as the planner's
+ * agg_simplify_hook (see optimizer/clauses.h): the hook is called once for
+ * every Aggref in every query, and it is this function's job to recognise
+ * sum(numeric)/avg(numeric) by aggfnoid and, if the input can be shown to be
+ * narrow enough, return a new Aggref carrying a different aggfnoid.
+ * Anything else is declined immediately.
  *
  * The proof is static.  It comes either from the argument's declared typmod or
  * from arithmetic over declared operands (see pps_derive_bounds): at
@@ -29,11 +32,11 @@
 #include "postgres.h"
 
 #include "catalog/pg_type.h"
+#include "commands/extension.h"
 #include "fmgr.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
 #include "nodes/primnodes.h"
-#include "nodes/supportnodes.h"
 #include "parser/parse_func.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
@@ -56,8 +59,6 @@
 #error "pg_prosupport requires PostgreSQL 15 or later (numeric typmod encoding)"
 #endif
 
-PG_FUNCTION_INFO_V1(pps_agg_support);
-
 /* the mantissa fits in int128 and the accumulator holds ~1.7e10 addends */
 #define PPS_MAX_PRECISION	28
 
@@ -79,12 +80,8 @@ static Oid	pps_scaled_sum_oid = InvalidOid;
 static Oid	pps_scaled_avg_oid = InvalidOid;
 static Oid	pps_scaled_sum_mul_oid = InvalidOid;
 static Oid	pps_scaled_avg_mul_oid = InvalidOid;
-static Oid	pps_cached_for_support = InvalidOid;
 static bool pps_cache_valid = false;
 static bool pps_oids_ok = false;
-
-/* see pps_agg_support(): complain about a wrong binding once per backend */
-static bool pps_warned_wrong_aggregate = false;
 
 /*
  * Dropped on any change to pg_proc, not just to our two rows.  Comparing
@@ -97,7 +94,6 @@ pps_syscache_reset(Datum arg, int cacheid, uint32 hashvalue)
 {
 	pps_cache_valid = false;
 	pps_oids_ok = false;
-	pps_warned_wrong_aggregate = false;
 }
 
 /* numeric typmod -> precision and scale; the scale is sign-extended */
@@ -119,24 +115,31 @@ pps_typmod_scale(int32 typmod)
  *
  * All names are schema-qualified, so search_path has no say in the result --
  * which matters, or the substitution would happen or not depending on a
- * session setting.  The extension's own schema is resolved dynamically because
- * the extension is relocatable.
+ * session setting.  The extension's own schema is resolved dynamically
+ * because the extension is relocatable; unlike a catalog-attached support
+ * function, agg_simplify_hook carries no OID of "self" to start from, so the
+ * schema comes from pg_extension via get_extension_oid()/
+ * get_extension_schema() instead of get_func_namespace().
  *
  * Returns false when our aggregates are missing: the extension may have been
- * dropped with the binding left in place, and there is no reason to fail
- * planning over that -- the query simply computes the stock aggregate.  A
- * missing built-in, on the other hand, means a broken catalog, and that is an
- * error rather than a reason to carry on quietly.
+ * dropped without the hook being cleared (which normally cannot happen --
+ * see the note on unloading in pg_prosupport.c -- but a stale cache entry
+ * from before a DROP EXTENSION/CREATE EXTENSION cycle in the same backend is
+ * exactly this case), and there is no reason to fail planning over that --
+ * the query simply computes the stock aggregate.  A missing built-in, on the
+ * other hand, means a broken catalog, and that is an error rather than a
+ * reason to carry on quietly.
  */
 static bool
-pps_load_oids(Oid self)
+pps_load_oids(void)
 {
+	Oid			extoid;
 	Oid			nsp;
 	Oid			builtin_args[1] = {NUMERICOID};
 	Oid			scaled_args[2] = {NUMERICOID, INT4OID};
 	Oid			mul_args[4] = {NUMERICOID, NUMERICOID, INT4OID, INT4OID};
 
-	if (pps_cache_valid && pps_cached_for_support == self)
+	if (pps_cache_valid)
 		return pps_oids_ok;
 
 	pps_sum_numeric_oid = LookupFuncName(list_make2(makeString("pg_catalog"),
@@ -148,7 +151,8 @@ pps_load_oids(Oid self)
 	if (!OidIsValid(pps_sum_numeric_oid) || !OidIsValid(pps_avg_numeric_oid))
 		elog(ERROR, "could not find pg_catalog.sum(numeric) or pg_catalog.avg(numeric)");
 
-	nsp = get_func_namespace(self);
+	extoid = get_extension_oid("pg_prosupport", true);
+	nsp = OidIsValid(extoid) ? get_extension_schema(extoid) : InvalidOid;
 	if (OidIsValid(nsp))
 	{
 		char	   *nspname = get_namespace_name(nsp);
@@ -182,13 +186,12 @@ pps_load_oids(Oid self)
 		OidIsValid(pps_scaled_avg_oid) &&
 		OidIsValid(pps_scaled_sum_mul_oid) &&
 		OidIsValid(pps_scaled_avg_mul_oid);
-	pps_cached_for_support = self;
 	pps_cache_valid = true;
 
 	if (!pps_oids_ok)
 		elog(DEBUG1, "pg_prosupport: the specialised aggregates were "
-			 "not found; the extension was probably dropped without "
-			 "detaching the support function first");
+			 "not found; the extension does not appear to be created "
+			 "in this database");
 
 	return pps_oids_ok;
 }
@@ -546,18 +549,21 @@ pps_scale_const(int value, AttrNumber resno)
 
 /*
  * pps_simplify_aggref
- *		The whole rewrite, with no dependency on the support-function protocol.
+ *		The whole rewrite.  Installed as the planner's agg_simplify_hook (see
+ *		pg_prosupport.c's _PG_init()) and called once for every Aggref the
+ *		planner meets, so the first thing it does is decide, from aggfnoid
+ *		alone, whether it has any business with this one at all.
  *
- * Returns the replacement node, or NULL to leave the aggregate alone.  The
- * caller passes the OID of the function this code is reached through --
- * pps_load_oids() needs it to find the extension's own schema.
+ * Returns the replacement node, or NULL to leave the aggregate alone.
  *
- * This lives apart from pps_agg_support() so that a fork without
- * SupportRequestSimplifyAggref can call the rewrite from wherever it does have
- * an Aggref in hand.
+ * root is unused today -- there is nothing here that needs the planner's
+ * infrastructure beyond the Aggref itself -- but it is part of
+ * agg_simplify_hook_type's signature, so it is accepted anyway, both to
+ * match and because a future check (say, on the query level the aggregate
+ * belongs to, beyond the plain agglevelsup test below) would want it.
  */
 Node *
-pps_simplify_aggref(Aggref *agg, Oid supportfnoid)
+pps_simplify_aggref(struct PlannerInfo *root, Aggref *agg)
 {
 	TargetEntry *tle;
 	Node	   *lhs;
@@ -576,15 +582,21 @@ pps_simplify_aggref(Aggref *agg, Oid supportfnoid)
 	 * pps_load_oids() prints its own reason when the specialised aggregates
 	 * cannot be found.  That is no longer a reason to give up immediately: the
 	 * constant-argument rewrite below does not need them, so the answer is
-	 * remembered and acted on only where it matters.
+	 * remembered and acted on only where it matters.  It is called
+	 * unconditionally, before we even know whether this Aggref is one of
+	 * ours, because it is what resolves pps_sum_numeric_oid/
+	 * pps_avg_numeric_oid in the first place -- there is nothing to compare
+	 * agg->aggfnoid against otherwise.  The lookups are cached, so on every
+	 * call after the first in a backend this is two flag checks.
 	 */
-	scaled_ok = pps_load_oids(supportfnoid);
+	scaled_ok = pps_load_oids();
 
 	/*
-	 * Which aggregate were we attached to?  The binding lives in an ALTER
-	 * FUNCTION, that is outside this code, so a support function attached to
-	 * something we do not know how to rewrite would otherwise be free to
-	 * produce nonsense.  Here it costs two comparisons.
+	 * Is this even one of ours?  Every Aggref in every query reaches this
+	 * hook, so this comparison, not a catalog attachment, is what used to be
+	 * "did the DBA point prosupport at us" -- and unlike that, declining a
+	 * count(*) or a max(text) here is the overwhelmingly common case, not a
+	 * misconfiguration, so there is nothing to log about it.
 	 */
 	if (agg->aggfnoid == pps_sum_numeric_oid)
 	{
@@ -597,24 +609,17 @@ pps_simplify_aggref(Aggref *agg, Oid supportfnoid)
 		newfn = pps_scaled_avg_oid;
 	}
 	else
+		return NULL;
+
+	/*
+	 * The off switch, checked here rather than by the caller, so that it
+	 * gates both rewrites below (the constant fold and the scale
+	 * specialisation) with a single test, on exactly the Aggrefs it is
+	 * meaningful to log about.
+	 */
+	if (!pps_enabled)
 	{
-		/*
-		 * Complain once per backend rather than once per Aggref.  This is
-		 * planning: an unconditional WARNING on a hot query would flood both
-		 * the log and the client, and would do so precisely when something
-		 * else in the log needs to be found.  The flag is cleared along with
-		 * the OID cache, so a binding that is fixed and then broken again will
-		 * speak up.
-		 */
-		if (!pps_warned_wrong_aggregate)
-		{
-			pps_warned_wrong_aggregate = true;
-			ereport(WARNING,
-					(errmsg("pg_prosupport support function is attached to aggregate %u",
-							agg->aggfnoid),
-					 errdetail("This support function only knows how to rewrite pg_catalog.sum(numeric) and pg_catalog.avg(numeric); the aggregate is left alone."),
-					 errhint("Detach it by setting that aggregate's pg_proc.prosupport back to 0.")));
-		}
+		pps_decline(agg->aggfnoid, "pg_prosupport.enabled is off");
 		return NULL;
 	}
 
@@ -641,10 +646,11 @@ pps_simplify_aggref(Aggref *agg, Oid supportfnoid)
 	 * to work around the problem: the price of a mistake here is a silently
 	 * wrong sum, not a slow query.
 	 *
-	 * aggsplit is not tested: SupportRequestSimplifyAggref arrives during
-	 * preprocessing, before the planner splits the aggregate, so it is always
-	 * AGGSPLIT_SIMPLE here.  Partial aggregation is in fact supported --
-	 * through combinefunc -- and a test for it would mislead the reader.
+	 * aggsplit is not tested: agg_simplify_hook is called from
+	 * eval_const_expressions_mutator() during preprocessing, before the
+	 * planner splits the aggregate, so it is always AGGSPLIT_SIMPLE here.
+	 * Partial aggregation is in fact supported -- through combinefunc -- and
+	 * a test for it would mislead the reader.
 	 */
 	Assert(agg->aggsplit == AGGSPLIT_SIMPLE);
 
@@ -710,8 +716,9 @@ pps_simplify_aggref(Aggref *agg, Oid supportfnoid)
 	Assert(p >= 1 && p <= PPS_MAX_PRECISION && s >= 0 && s <= p);
 
 	/*
-	 * Build a copy rather than editing the node in place: the comment on
-	 * SupportRequestSimplifyAggref requires it.
+	 * Build a copy rather than editing the node in place: agg_simplify_hook,
+	 * like any other eval_const_expressions_mutator() rewrite, must not
+	 * modify the original.
 	 */
 	newagg = copyObject(agg);
 	newagg->aggfnoid = newfn;
@@ -719,27 +726,4 @@ pps_simplify_aggref(Aggref *agg, Oid supportfnoid)
 	newagg->aggargtypes = lappend_oid(newagg->aggargtypes, INT4OID);
 
 	return (Node *) newagg;
-}
-
-Datum
-pps_agg_support(PG_FUNCTION_ARGS)
-{
-	Node	   *rawreq = (Node *) PG_GETARG_POINTER(0);
-
-	if (IsA(rawreq, SupportRequestSimplifyAggref))
-	{
-		SupportRequestSimplifyAggref *req = (SupportRequestSimplifyAggref *) rawreq;
-
-		if (!pps_enabled)
-		{
-			pps_decline(req->aggref->aggfnoid,
-						"pg_prosupport.enabled is off");
-			PG_RETURN_POINTER(NULL);
-		}
-
-		PG_RETURN_POINTER(pps_simplify_aggref(req->aggref,
-											  fcinfo->flinfo->fn_oid));
-	}
-
-	PG_RETURN_POINTER(NULL);
 }

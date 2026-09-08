@@ -3,23 +3,30 @@
 Extra PostgreSQL query tree optimisations that might be done with the prosupport
 machinery.
 
-An aggregate call can be rewritten at plan time from an extension, on a stock
-server. `pg_proc.prosupport` of an aggregate is an ordinary catalog field, and
-`simplify_aggref()` hands whatever it points at a
-`SupportRequestSimplifyAggref` — the same mechanism that turns `COUNT(1)` into
-`COUNT(*)`. This extension is a home for rewrites reached that way. **No patched
-server is required — from PostgreSQL 19.**
+An aggregate call can be rewritten at plan time from an extension, through a
+single planner hook, `agg_simplify_hook`: the planner calls it, if set, for
+every `Aggref` it meets while simplifying the query tree, and whatever
+non-`NULL` node the hook returns takes the `Aggref`'s place — the same point
+in planning, and the same shape of rewrite, that PostgreSQL 19's
+`SupportRequestSimplifyAggref` reaches through `pg_proc.prosupport` (commit
+`42473b3b31`, which turns `COUNT(1)` into `COUNT(*)`). This extension is a
+home for rewrites reached that way, and its own hook function decides, from
+`aggref->aggfnoid` alone, which aggregates it wants and leaves everything
+else — the overwhelming majority of calls — alone.
 
-`simplify_aggref()`'s call to `SupportRequestSimplifyAggref` is itself new in
-PostgreSQL 19 (commit `42473b3b31`). On PostgreSQL 18 the aggregate's
-`prosupport` field exists and can be set exactly as described below, but the
-planner never consults it, so nothing fires. `patches/` carries a small,
-tested backport of just that hook — no COUNT(1)/COUNT(*) support function,
-no other core behaviour change — for building a PG18 that pg_prosupport can
-attach to; see `patches/pg18-support-request-simplify-aggref.patch` for how
-to apply it. `numeric_agg`/`const_agg` (`make installcheck`) pass against a
-PG18 built with that patch, and PG18's own `make check` (231/231) is
-unaffected by it.
+**`agg_simplify_hook` is not stock; it needs the small patch in `patches/`.**
+Unlike `SupportRequestSimplifyAggref`, which is a catalog-driven dispatch
+that any PostgreSQL 19 server already has, `agg_simplify_hook` is a plain
+global hook — in the same family as `planner_hook`, `set_rel_pathlist_hook`
+and `join_search_hook` — that this project adds to the planner itself, on
+purpose, in favour of the catalog machinery: no `pg_proc.prosupport` write,
+no `pg_depend` bookkeeping, no per-aggregate attachment to get wrong.
+`patches/pg18-agg-simplify-hook.patch` is a small, tested patch that adds
+just this hook to a PostgreSQL 18 tree; see that file for what it changes and
+how to apply it. `numeric_agg`/`const_agg` (`make installcheck`) pass against
+a PG18 built with it, and PG18's own `make check` (231/231) is unaffected,
+since the hook is `NULL` — one predicted-not-taken branch per `Aggref` — on a
+server where nothing has installed it.
 
 Two of them so far, both aimed at what generated SQL — 1C, in the workload this
 came from — does to `sum(numeric)`:
@@ -61,30 +68,35 @@ psql -f bench/queries.sql                            # rewritten
 psql -v enabled=off -f bench/queries.sql             # stock
 ```
 
-Attach the support function first.
+Load the extension first.
 
-## Attaching the support function
+## Loading the extension
 
-Everything hangs on `pg_proc.prosupport` of the built-in aggregate. There is no
-DDL that writes it for an aggregate — `ALTER FUNCTION ... SUPPORT` refuses
-aggregates outright, and `ALTER AGGREGATE` has no `SUPPORT` clause — so the
-field is written directly, as superuser, once per database:
+There is no catalog attachment step, unlike a `SupportRequestSimplify`-based
+rewrite reached through `pg_proc.prosupport`: `agg_simplify_hook` is
+installed once, by `_PG_init()`, when the shared library is loaded — and
+that is the one thing `CREATE EXTENSION` on its own does *not* do. It
+creates `numeric_scaled_sum` and the rest as ordinary catalog objects, but
+the library itself is only `dlopen()`ed when one of its C functions is
+actually called, which none of these are until an `Aggref` has already been
+rewritten to name one. For the hook to ever run, load the library through
+one of the ways PostgreSQL offers for that:
 
-```sql
-CREATE EXTENSION pg_prosupport;
-
-UPDATE pg_proc SET prosupport = 'pps_agg_support'::regproc
- WHERE oid IN ('pg_catalog.sum(numeric)'::regprocedure,
-               'pg_catalog.avg(numeric)'::regprocedure);
+```
+# postgresql.conf, before the server starts — the normal way to run this
+shared_preload_libraries = 'pg_prosupport'
 ```
 
-Detaching is the same statement with a zero:
-
 ```sql
-UPDATE pg_proc SET prosupport = 0
- WHERE oid IN ('pg_catalog.sum(numeric)'::regprocedure,
-               'pg_catalog.avg(numeric)'::regprocedure);
+-- or, mid-session, if the server was not started that way
+LOAD 'pg_prosupport';
 ```
+
+`session_preload_libraries` works the same way as `shared_preload_libraries`
+but per-session rather than per-cluster. Either way, `CREATE EXTENSION
+pg_prosupport;` is still needed once per database, to create
+`numeric_scaled_sum` and its siblings — loading the library alone installs
+the hook but creates no aggregates for it to substitute.
 
 Check:
 
@@ -103,40 +115,15 @@ EXPLAIN SELECT sum(amount) FROM docs;
 --         scale for the argument within the supported range
 ```
 
-**Read the next section before you run any of this.** Writing the catalog by
-hand skips the bookkeeping that a DDL command would have done, and the
-consequences are not theoretical.
-
-### Caveats of writing prosupport by hand
-
-**No dependency is recorded.** `pg_depend` gets nothing, so nothing stops you
-from dropping the extension while `prosupport` still points at
-`pps_agg_support`. Do that and every query using `sum(numeric)` in that database
-stops planning:
-
-```
-ERROR:  cache lookup failed for function 26396
-```
-
-That is not a degraded plan, it is a hard failure on a very ordinary query, and
-it lasts until someone sets `prosupport` back to zero with the statement above.
-**Always detach before `DROP EXTENSION`.**
-
-**An OID can be reused.** If the support function is dropped and its OID is
-later handed to an unrelated function, the planner will call that function with
-a `SupportRequestSimplifyAggref` pointer. Same rule, same reason: detach first.
-
-**Saved plans do not notice.** A backend holding a generic plan built with a
-rewrite in it keeps using it after the catalog write, because the plan no longer
-mentions `sum(numeric)` for the invalidation machinery to match on. Existing
-sessions need `DISCARD PLANS` or a reconnect. The GUCs below do flush the plan
-cache and are the better switch when you need one in a hurry.
-
-All three are properties of writing the catalog directly, not of the rewrites.
-A core patch that teaches `ALTER FUNCTION` to accept `SUPPORT` on an aggregate —
-which records the dependency — and makes `simplify_aggref()` record the plan's
-dependency on the original aggregate would remove all three. The extension does
-not need it, and does not assume it.
+There is no equivalent of writing `pg_proc.prosupport` back to zero to detach
+the extension in one session while it stays installed elsewhere — the hook,
+once loaded, applies to every database in the cluster (or every session that
+loads it, with `session_preload_libraries`/`LOAD`). `SET pg_prosupport.enabled
+= off` (see Disabling, below) is the per-session and per-database way to stop
+the rewrites without touching how the library is loaded, and `DROP EXTENSION
+pg_prosupport;` can be run at any time, in any order, without special care:
+nothing outside `pg_depend`'s own bookkeeping points at the extension's
+objects, since none of this is reached through a catalog field.
 
 ## Building
 
@@ -161,9 +148,12 @@ make check
 make USE_PGXS=1 PG_CONFIG=/path/to/bin/pg_config installcheck PGPORT=5432
 ```
 
-`numeric_agg` covers the scale specialisation, `const_agg` the constant rewrite.
-Both attach the support function the way this README does, so they run on any
-server from PostgreSQL 15 up.
+`numeric_agg` covers the scale specialisation, `const_agg` the constant
+rewrite. Both `LOAD 'pg_prosupport';` the way this README does, so they
+exercise `agg_simplify_hook` end to end -- which means the server under test
+needs `patches/pg18-agg-simplify-hook.patch` (or an equivalent for whichever
+version you are building) applied, not just PostgreSQL 15 or later for
+numeric's typmod encoding.
 
 ## sum() over a constant
 
@@ -329,22 +319,22 @@ They are separate switches because the two rewrites fail in different ways: the
 specialised aggregates can be wrong about a scale, whereas the constant rewrite
 changes the expression tree of a query.
 
-**Entirely, leaving the extension installed** — detach, as in section 2.
-Sessions that already hold a generic plan keep the rewrite until they replan;
-`DISCARD PLANS` or a reconnect settles that.
+**Entirely** — remove `pg_prosupport` from `shared_preload_libraries` (or
+`session_preload_libraries`) and restart/reconnect; a session that loaded it
+with a bare `LOAD` stops having it the moment that session ends. Sessions
+that already hold a generic plan built with a rewrite in it keep using that
+plan until they replan; `DISCARD PLANS` or a reconnect settles that.
 
-**Removal.** The order matters, and nothing enforces it:
+**Removal.** In any order, and with no special care:
 
 ```sql
-UPDATE pg_proc SET prosupport = 0
- WHERE oid IN ('pg_catalog.sum(numeric)'::regprocedure,
-               'pg_catalog.avg(numeric)'::regprocedure);
 DROP EXTENSION pg_prosupport;
 ```
 
-Dropping the extension first leaves `prosupport` pointing at a function that no
-longer exists, and every `sum(numeric)` in the database then fails to plan with
-`cache lookup failed for function NNNNN`. The way out is the same `UPDATE`.
+There is nothing else pointing at its objects for a stale reference to break:
+unlike a hand-written `pg_proc.prosupport`, everything here is ordinary
+`pg_depend`-tracked catalog state, and the hook itself only ever runs while
+the library is loaded in the first place.
 
 ## Licence
 

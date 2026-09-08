@@ -1,13 +1,10 @@
 CREATE EXTENSION pg_prosupport;
 
--- The support function is attached by writing pg_proc.prosupport, which is what
--- the README tells the user to do and the only thing that works on a stock
--- server: ALTER FUNCTION refuses aggregates and ALTER AGGREGATE has no SUPPORT
--- clause.  The field itself is stock, and so is the request the planner sends
--- through it.
-UPDATE pg_proc SET prosupport = 'pps_agg_support'::regproc
- WHERE oid IN ('pg_catalog.sum(numeric)'::regprocedure,
-			   'pg_catalog.avg(numeric)'::regprocedure);
+-- The substitution happens through agg_simplify_hook, a global planner hook
+-- that _PG_init() installs when the library is loaded -- see the README.
+-- CREATE EXTENSION creates the catalog objects but does not by itself load
+-- the library; LOAD does, for this session.
+LOAD 'pg_prosupport';
 
 --
 -- When the substitution happens and when it does not
@@ -490,26 +487,24 @@ DEALLOCATE psum;
 RESET plan_cache_mode;
 
 --
--- Attached to an aggregate we do not know.  There must be no substitution, and
--- the complaint must come once per backend: at planning time an unconditional
--- WARNING would flood the log and the client.
+-- An aggregate we do not know, e.g. max(numeric): agg_simplify_hook is
+-- called for it too, since it is called for every Aggref in the query, not
+-- just sum()/avg().  There must be no substitution and no complaint -- this
+-- is the overwhelmingly common case, not a misconfiguration.
 --
-UPDATE pg_proc SET prosupport = 'pps_agg_support'::regproc
- WHERE oid = 'pg_catalog.max(numeric)'::regprocedure;
-EXPLAIN (verbose, costs off) SELECT max(v) FROM t_ok;
 EXPLAIN (verbose, costs off) SELECT max(v) FROM t_ok;
 SELECT max(v) FROM t_ok;
-UPDATE pg_proc SET prosupport = 0
- WHERE oid = 'pg_catalog.max(numeric)'::regprocedure;
 
 --
--- Detaching
+-- Turning the switch off is the way to stop the rewrites without a restart;
+-- there is no catalog attachment to undo.  (Already exercised above per
+-- rewrite; this is the same check once more, right before the extension
+-- comes back down.)
 --
-UPDATE pg_proc SET prosupport = 0
- WHERE oid IN ('pg_catalog.sum(numeric)'::regprocedure,
-			   'pg_catalog.avg(numeric)'::regprocedure);
+SET pg_prosupport.enabled = off;
 EXPLAIN (verbose, costs off) SELECT sum(v) FROM t_ok;
 EXPLAIN (verbose, costs off) SELECT avg(v) FROM t_ok;
+RESET pg_prosupport.enabled;
 
 DROP TABLE t_ok, t_wide, t_w28, t_w29, t_plain, t_int0, t_frac, t_dom, t_dom2,
 		   t_bulk, t_ref, t_big, t_bigw, t_ab, t_avgref, t_mul, t_mulref;
