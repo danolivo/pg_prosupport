@@ -1,17 +1,24 @@
 /*-------------------------------------------------------------------------
  *
  * pg_prosupport.c
- *	  Module entry point: the switches, the plan-cache discipline that goes
- *	  with them, and the one piece of reporting all the rewrites share.
+ *	  Module entry point: the agg_simplify_hook registration, the switches,
+ *	  the plan-cache discipline that goes with them, and the one piece of
+ *	  reporting all the rewrites share.
  *
- * The extension is a home for plan-time rewrites that PostgreSQL's prosupport
- * machinery makes reachable from outside the core.  Each rewrite lives in its
- * own file and is switched separately; this file owns nothing but what they
- * have in common.
+ * The extension is a home for plan-time rewrites reached through
+ * agg_simplify_hook, a single global hook that the patched planner (see
+ * patches/) calls for every Aggref it meets.  _PG_init() below installs
+ * pps_agg_simplify_hook() there, chaining whatever hook -- if any -- was
+ * already in place; numeric_support.c and constagg.c do the actual work,
+ * recognising sum(numeric)/avg(numeric) by aggfnoid and declining everything
+ * else.
  *
- * There is one support function per target aggregate, and it is attached by
- * writing pg_proc.prosupport -- see the README.  Nothing here needs a patched
- * server: SupportRequestSimplifyAggref is stock, and so is the field.
+ * Because the hook is what does the work, and not a pg_proc.prosupport entry
+ * that fmgr resolves on demand, the library has to be loaded before planning
+ * ever happens: via shared_preload_libraries (the normal way), via
+ * session_preload_libraries, or with LOAD.  CREATE EXTENSION alone creates
+ * the catalog objects but does not by itself cause the .so to be dlopen'd,
+ * so it is not enough on its own; see the README.
  *
  * Copyright (c) 2026, Andrei Lepikhov
  *
@@ -25,6 +32,7 @@
 #include "postgres.h"
 
 #include "fmgr.h"
+#include "optimizer/clauses.h"
 #include "utils/guc.h"
 #include "utils/inval.h"
 #include "utils/lsyscache.h"
@@ -39,20 +47,47 @@ void		_PG_init(void);
 
 /*
  * The off switch.  A rewrite changes the behaviour of a very widely used
- * function for a whole database at once, and taking it off by writing
- * pg_proc.prosupport needs superuser and is global.  That is not enough: when
- * it turns out at three in the morning that some row source does not honour
- * its own typmod, one needs a way to disable the optimisation in a single
- * session without touching the catalog.
+ * function for a whole database at once, and the hook is global and
+ * installed for as long as the server runs -- there is no equivalent of
+ * writing pg_proc.prosupport back to 0 to reach for at three in the morning.
+ * This is the way to disable the optimisations in a single session (or a
+ * single database, with ALTER DATABASE) without a restart.
  */
 bool		pps_enabled = true;
 
+/* whatever agg_simplify_hook held before we installed ours */
+static agg_simplify_hook_type prev_agg_simplify_hook = NULL;
+
 /*
- * The module is loaded lazily -- on the first call of a support function, that
- * is from the middle of planning.  Until _PG_init() has finished, the plan
- * cache must not be touched; see pps_assign_enabled().
+ * The module is loaded either at postmaster start (shared_preload_libraries)
+ * or by LOAD/session_preload_libraries mid-session; either way _PG_init()
+ * runs before any query of this session is planned, well before
+ * pps_agg_simplify_hook() can ever be called.  Until _PG_init() has
+ * finished, though, the plan cache must not be touched; see
+ * pps_assign_enabled().
  */
 static bool pps_ready = false;
+
+/*
+ * pps_agg_simplify_hook
+ *		The planner's agg_simplify_hook, chaining to whatever was there
+ *		before us.
+ *
+ * All the actual recognising-and-rewriting logic is pps_simplify_aggref()'s;
+ * this exists only to fall through to prev_agg_simplify_hook when our own
+ * rewrite declines, the standard pattern for a hook more than one loaded
+ * module might want.
+ */
+static Node *
+pps_agg_simplify_hook(PlannerInfo *root, Aggref *aggref)
+{
+	Node	   *result = pps_simplify_aggref(root, aggref);
+
+	if (result != NULL)
+		return result;
+
+	return prev_agg_simplify_hook ? prev_agg_simplify_hook(root, aggref) : NULL;
+}
 
 /*
  * pps_assign_enabled
@@ -69,14 +104,16 @@ static bool pps_ready = false;
  * The hook runs before the variable is assigned, hence the comparison rather
  * than an unconditional flush.
  *
- * The delicate part is pps_ready.  The module loads lazily: if a session did
- * SET pg_prosupport.enabled = off before the load, the value sat in a
- * placeholder, and DefineCustomBoolVariable() below reassigns it, firing this
- * hook.  That happens inside the first planning cycle, that is inside
- * BuildCachedPlan(), and ResetPlanCache() would mark invalid the very
- * CachedPlanSource being built.  There is also nothing to flush at that
- * moment: no plan knows about any rewrite yet, the extension has only just
- * been loaded.
+ * The delicate part is pps_ready.  If pg_prosupport.enabled = off already
+ * sat in a placeholder GUC when this module loaded -- from postgresql.conf
+ * together with shared_preload_libraries, or from an earlier SET in the
+ * session together with session_preload_libraries or LOAD --
+ * DefineCustomBoolVariable() below reassigns the real variable and fires
+ * this hook while _PG_init() is still running.  Calling ResetPlanCache() at
+ * that point would be wrong: nothing has been planned with our hook
+ * installed yet, so there is nothing to flush, and during
+ * shared_preload_libraries processing there is not even a plan cache to
+ * flush.
  */
 static void
 pps_assign_enabled(bool newval, void *extra)
@@ -123,6 +160,9 @@ _PG_init(void)
 	CacheRegisterSyscacheCallback(PROCOID, pps_syscache_reset, (Datum) 0);
 
 	MarkGUCPrefixReserved("pg_prosupport");
+
+	prev_agg_simplify_hook = agg_simplify_hook;
+	agg_simplify_hook = pps_agg_simplify_hook;
 
 	/* from here on the assign hooks may touch the plan cache */
 	pps_ready = true;
