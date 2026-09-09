@@ -151,10 +151,10 @@ EXPLAIN (verbose, costs off) SELECT sum(v) FROM t_const;
 --
 SET pg_prosupport.fold_const_sum = off;
 EXPLAIN (verbose, costs off) SELECT sum('0'::numeric) FROM t_const;
-                  QUERY PLAN                   
------------------------------------------------
+                     QUERY PLAN                     
+----------------------------------------------------
  Aggregate
-   Output: numeric_scaled_sum('0'::numeric, 0)
+   Output: numeric_scaled_sum_expr('0'::numeric, 0)
    ->  Seq Scan on public.t_const
          Output: grp, v
 (4 rows)

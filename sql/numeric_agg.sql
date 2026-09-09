@@ -340,13 +340,13 @@ SELECT sum(v) FROM (VALUES ('NaN'::numeric(18,2)), (1.00)) x(v);
 SELECT sum(v) FROM (VALUES ('NaN'::numeric(18,2)), (NULL)) x(v);
 SELECT 'Infinity'::numeric(18,2);
 
-SELECT numeric_scaled_sum(v, 2)
+SELECT numeric_scaled_sum_expr(v, 2)
   FROM (VALUES ('Infinity'::numeric), (1.00)) x(v);
-SELECT numeric_scaled_sum(v, 2)
+SELECT numeric_scaled_sum_expr(v, 2)
   FROM (VALUES ('-Infinity'::numeric), (1.00)) x(v);
-SELECT numeric_scaled_sum(v, 2)
+SELECT numeric_scaled_sum_expr(v, 2)
   FROM (VALUES ('Infinity'::numeric), ('-Infinity')) x(v);
-SELECT numeric_scaled_sum(v, 2)
+SELECT numeric_scaled_sum_expr(v, 2)
   FROM (VALUES ('NaN'::numeric), ('Infinity')) x(v);
 
 --
@@ -465,9 +465,9 @@ RESET min_parallel_table_scan_size;
 -- A broken contract.  Calling the aggregate directly with a scale the value
 -- does not conform to has to raise an error rather than round quietly.
 --
-SELECT numeric_scaled_sum(v, 2) FROM (VALUES (1.234::numeric)) x(v);
-SELECT numeric_scaled_sum(v, 2) FROM (VALUES (1e26::numeric)) x(v);
-SELECT numeric_scaled_sum(v, 2) FROM (VALUES (1e30::numeric)) x(v);
+SELECT numeric_scaled_sum_expr(v, 2) FROM (VALUES (1.234::numeric)) x(v);
+SELECT numeric_scaled_sum_expr(v, 2) FROM (VALUES (1e26::numeric)) x(v);
+SELECT numeric_scaled_sum_expr(v, 2) FROM (VALUES (1e30::numeric)) x(v);
 
 --
 -- The off switch has to reach a saved generic plan.  A GUC is not a source of
@@ -475,15 +475,21 @@ SELECT numeric_scaled_sum(v, 2) FROM (VALUES (1e30::numeric)) x(v);
 -- connection pool, where a generic plan can live for hours, those are exactly
 -- the sessions the switch was added for.
 --
+-- avg(numeric), not sum(numeric): sum(v) over a plain numeric(p,s) column is
+-- substituted by core's own simplify_sum_numeric_aggref() now (see
+-- patches/pg18-numeric-scaled-sum-catalog.patch), unconditionally and with no
+-- GUC of its own, so it would no longer show the switch doing anything.
+-- avg(numeric) is still entirely this extension's rewrite.
+--
 SET plan_cache_mode = force_generic_plan;
-PREPARE psum AS SELECT sum(v) FROM t_ok;
-EXPLAIN (verbose, costs off) EXECUTE psum;
+PREPARE pavg AS SELECT avg(v) FROM t_ok;
+EXPLAIN (verbose, costs off) EXECUTE pavg;
 SET pg_prosupport.enabled = off;
-EXPLAIN (verbose, costs off) EXECUTE psum;
+EXPLAIN (verbose, costs off) EXECUTE pavg;
 RESET pg_prosupport.enabled;
-EXPLAIN (verbose, costs off) EXECUTE psum;
+EXPLAIN (verbose, costs off) EXECUTE pavg;
 
-DEALLOCATE psum;
+DEALLOCATE pavg;
 RESET plan_cache_mode;
 
 --
@@ -496,10 +502,13 @@ EXPLAIN (verbose, costs off) SELECT max(v) FROM t_ok;
 SELECT max(v) FROM t_ok;
 
 --
--- Turning the switch off is the way to stop the rewrites without a restart;
--- there is no catalog attachment to undo.  (Already exercised above per
--- rewrite; this is the same check once more, right before the extension
--- comes back down.)
+-- Turning the switch off is the way to stop this extension's own rewrites
+-- without a restart; there is no catalog attachment to undo.  sum(v) is
+-- included for contrast, not because the switch does anything to it any
+-- more: it stays substituted by core regardless, which is the point of
+-- moving it to the catalog in the first place (nothing here is ever wrong to
+-- do, so there is nothing for a switch to decide).  avg(v) is still ours to
+-- turn off.
 --
 SET pg_prosupport.enabled = off;
 EXPLAIN (verbose, costs off) SELECT sum(v) FROM t_ok;

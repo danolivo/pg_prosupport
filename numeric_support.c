@@ -76,7 +76,7 @@
  */
 static Oid	pps_sum_numeric_oid = InvalidOid;
 static Oid	pps_avg_numeric_oid = InvalidOid;
-static Oid	pps_scaled_sum_oid = InvalidOid;
+static Oid	pps_scaled_sum_expr_oid = InvalidOid;
 static Oid	pps_scaled_avg_oid = InvalidOid;
 static Oid	pps_scaled_sum_mul_oid = InvalidOid;
 static Oid	pps_scaled_avg_mul_oid = InvalidOid;
@@ -157,9 +157,9 @@ pps_load_oids(void)
 	{
 		char	   *nspname = get_namespace_name(nsp);
 
-		pps_scaled_sum_oid =
+		pps_scaled_sum_expr_oid =
 			LookupFuncName(list_make2(makeString(nspname),
-									  makeString("numeric_scaled_sum")),
+									  makeString("numeric_scaled_sum_expr")),
 						   2, scaled_args, true);
 		pps_scaled_avg_oid =
 			LookupFuncName(list_make2(makeString(nspname),
@@ -176,13 +176,13 @@ pps_load_oids(void)
 	}
 	else
 	{
-		pps_scaled_sum_oid = InvalidOid;
+		pps_scaled_sum_expr_oid = InvalidOid;
 		pps_scaled_avg_oid = InvalidOid;
 		pps_scaled_sum_mul_oid = InvalidOid;
 		pps_scaled_avg_mul_oid = InvalidOid;
 	}
 
-	pps_oids_ok = OidIsValid(pps_scaled_sum_oid) &&
+	pps_oids_ok = OidIsValid(pps_scaled_sum_expr_oid) &&
 		OidIsValid(pps_scaled_avg_oid) &&
 		OidIsValid(pps_scaled_sum_mul_oid) &&
 		OidIsValid(pps_scaled_avg_mul_oid);
@@ -597,11 +597,21 @@ pps_simplify_aggref(struct PlannerInfo *root, Aggref *agg)
 	 * "did the DBA point prosupport at us" -- and unlike that, declining a
 	 * count(*) or a max(text) here is the overwhelmingly common case, not a
 	 * misconfiguration, so there is nothing to log about it.
+	 *
+	 * Note that agg_simplify_hook only runs when core's own direct call
+	 * (simplify_sum_numeric_aggref(), for sum(numeric) alone) has already
+	 * declined -- see clauses.c.  So an aggfnoid still equal to
+	 * pps_sum_numeric_oid here means one of: DISTINCT/ORDER BY/FILTER/
+	 * VARIADIC/an outer reference, or an argument whose precision and scale
+	 * are not a plain typmod core can read off directly -- typically an
+	 * arithmetic expression, which is exactly what pps_derive_bounds() below
+	 * is for.  A plain sum(c) with c declared numeric(p,s) never reaches this
+	 * function at all any more.
 	 */
 	if (agg->aggfnoid == pps_sum_numeric_oid)
 	{
 		is_sum = true;
-		newfn = pps_scaled_sum_oid;
+		newfn = pps_scaled_sum_expr_oid;
 	}
 	else if (agg->aggfnoid == pps_avg_numeric_oid)
 	{
@@ -681,7 +691,7 @@ pps_simplify_aggref(struct PlannerInfo *root, Aggref *agg)
 	 */
 	if (pps_split_product((Node *) tle->expr, &lhs, &rhs, &s1, &s2))
 	{
-		newfn = (newfn == pps_scaled_sum_oid) ? pps_scaled_sum_mul_oid
+		newfn = (newfn == pps_scaled_sum_expr_oid) ? pps_scaled_sum_mul_oid
 			: pps_scaled_avg_mul_oid;
 
 		newagg = copyObject(agg);
