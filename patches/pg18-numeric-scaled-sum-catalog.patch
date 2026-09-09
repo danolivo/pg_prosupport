@@ -84,6 +84,15 @@ or, inside a git checkout, with git apply in the same order. A build from
 this tree requires a fresh initdb: new pg_proc/pg_aggregate rows change the
 system catalogs, so an existing data directory from before the patch cannot
 be reused.
+
+Also adds src/backend/utils/adt/README.numeric_scaled_sum, a plain-text
+subsystem README in the usual PostgreSQL style: what NumericScaledAggState
+buys over NumericAggState and why, where the mantissa extraction avoids
+building an intermediate Numeric, why the final reconstruction is allowed to
+be comparatively expensive (it runs once per group, not once per row), and
+how this relates to the further specialisations (product folding, avg,
+arithmetic-expression arguments) that pg_prosupport itself still provides
+through agg_simplify_hook.
 ---
 diff --git a/src/backend/optimizer/util/clauses.c b/src/backend/optimizer/util/clauses.c
 index c8d5835..8fd175d 100644
@@ -125,6 +134,244 @@ index c8d5835..8fd175d 100644
  					newnode = agg_simplify_hook(context->root, (Aggref *) node);
  					if (newnode != NULL)
  						return newnode;
+diff --git a/src/backend/utils/adt/README.numeric_scaled_sum b/src/backend/utils/adt/README.numeric_scaled_sum
+new file mode 100644
+index 0000000..83cfc90
+--- /dev/null
++++ b/src/backend/utils/adt/README.numeric_scaled_sum
+@@ -0,0 +1,232 @@
++src/backend/utils/adt/README.numeric_scaled_sum
++
++Scaled numeric aggregates
++==========================
++
++This file documents the mechanism behind numeric_scaled_sum(numeric, int4)
++and its relatives (numeric_scaled_avg, and pg_prosupport's own
++numeric_scaled_sum_expr / numeric_scaled_sum_mul / numeric_scaled_avg_mul,
++built the same way but reached through agg_simplify_hook instead of the
++direct call described here). It exists because "why is this faster" has more
++than one answer, and none of them is "it's written in C" -- sum(numeric) is
++already written in C. The wins are structural, and each one is independent
++of the others: removing any single one of them gives some of the benefit
++back.
++
++The problem with sum(numeric)
++------------------------------
++
++sum(numeric) and avg(numeric) share NumericAggState (numeric.c) as their
++transition state. It holds an arbitrary-precision running total, accumulated
++digit array by digit array through accum_sum_add(), because that is what a
++NUMERIC column's contract requires in general: unbounded precision, exact
++decimal arithmetic, no assumption about how many digits a value has.
++
++Two costs follow directly from that generality, and both are paid on every
++single input row, not just once per group or once per query:
++
++  - accum_sum_add() walks the addend's digit array (base NBASE = 10000, four
++    decimal digits per NumericDigit) and does carry-propagating addition into
++    a bank of int32 accumulators, one per digit position -- because the
++    result's width is not known ahead of time, the state has to be prepared
++    to hold as many digits as the widest input plus overflow room seen so
++    far. This is a small loop, but it runs on every row, and it is a loop
++    over a variable-length array rather than one machine instruction.
++
++  - The state itself is not a fixed-size struct. NumericAggState's sumX field
++    (a NumericSumAccum) grows its digit buffer with repalloc() as wider
++    values arrive, and every input Numeric that reaches do_numeric_accum()
++    was itself built by detoasting and, for anything that went through
++    arithmetic upstream, by a separate palloc'd NumericVar with its own
++    digit buffer. None of this is a single cache-line object: it is a
++    struct holding pointers to separately allocated arrays, and the
++    allocator, not just the CPU, is on the hot path.
++
++hash_agg_entry_size() -- what plans the spill point of a HashAggregate --
++takes the size of one group's transition state from aggtransspace in
++pg_aggregate.dat. For sum(numeric)/avg(numeric) that number describes a
++struct whose real footprint, digit buffers included, is larger and less
++predictable than the declared value; the planner's estimate of how many
++groups fit in work_mem is accordingly optimistic, and a query that looked
++like it would stay in memory spills.
++
++The state: one cache line, no pointers
++----------------------------------------
++
++NumericScaledAggState (numeric.c) replaces all of that with:
++
++    typedef struct NumericScaledAggState
++    {
++        int128      sumX;         /* sum of mantissas at scale "scale" */
++        int64       N;
++        int64       NaNcount;
++        int64       pInfcount;
++        int64       nInfcount;
++        int32       scale;
++    } NumericScaledAggState;
++
++Fifty-six bytes (checked by a StaticAssertDecl, so a change here that isn't
++matched in pg_aggregate.dat's aggtransspace fails the build, not silently
++skews planning), no field that is a pointer to something else. Accumulating
++a value is one int128 addition. There is no repalloc, no digit array, no
++detoast-then-reparse of an intermediate NumericVar for the running total --
++the total lives entirely inside the struct itself, and the struct never
++grows.
++
++This is what aggtransspace being accurate actually buys: hash_agg_entry_size()
++now reflects the true memory cost of a group, so the spill point the planner
++computes is the spill point that happens, and a HashAggregate with a lot of
++groups keeps three to four times as many of them in the same work_mem before
++falling back to disk (measured, not estimated -- see the extension's own
++README.md and bench/ for the numbers on real data).
++
++The other side of "no pointers" is cache behaviour under GROUP BY. A
++HashAggregate's entries are read and written in whatever order the hash
++table visits them, which is not the order rows arrived in; a state that is
++one contiguous 56-byte object stays in one cache line, while a
++NumericAggState's digit buffers are separate allocations the CPU has to chase
++a pointer to reach, once per group per row. The size difference and the
++pointer-chasing difference are separate effects, and the second one does not
++show up in aggtransspace at all -- it shows up as cache misses, and it is why
++the measured win is larger than the raw byte-count difference alone would
++predict.
++
++Where the mantissa comes from: no intermediate Numeric
++---------------------------------------------------------
++
++Accumulating an int128 requires turning the input Numeric into "the value,
++shifted by scale decimal places, as an integer" -- the mantissa. The obvious
++way to get that is arithmetic: multiply the numeric by 10^scale using the
++existing numeric_mul() machinery, then convert the (now integral) result to
++an integer. That would still cost a full NumericVar allocation and a real
++multiplication per row, defeating the point.
++
++numeric_scaled_mantissa() (numeric.c) does not do arithmetic on Numeric
++values at all. It reads the digit array PostgreSQL already unpacked --
++NumericVar's ndigits/weight/digits, reached via the existing
++init_var_from_num(), which does not copy or allocate, it just points into
++the Numeric that is already in memory -- and runs a Horner-scheme reduction
++directly over those base-10000 digits into a native int128:
++
++    m = 0;
++    for each digit d in the value, most significant first:
++        m = m * NBASE + d;
++
++with one correction for the difference between the value's own stored scale
++and the target scale (a single multiply or an exact-division check by a
++power of ten below NBASE, since the two scales can only ever differ by fewer
++than four decimal digits -- the rest of the alignment falls out of the
++Horner loop itself). This is arithmetic on machine integers using the digits
++PostgreSQL already has in hand, not a second numeric value built and thrown
++away.
++
++The precision bound (see below) exists precisely so this loop cannot
++overflow: every partial product stays under 10^28, comfortably inside int128
++regardless of how many digits are left to fold in.
++
++Reconstruction happens once per group, not once per row
++------------------------------------------------------------
++
++The inverse operation -- turning the accumulated int128 mantissa back into a
++NUMERIC, in numeric_scaled_sum_final() -- is comparatively expensive: it
++splits the mantissa into three 18-digit chunks and rebuilds the value through
++three calls to int64_div_fast_to_numeric() plus two numeric_add_opt_error()
++calls, because that is the only way to reintroduce the correct weight/dscale
++without a bespoke 128-bit-aware division routine. (An early version of this
++code tried to skip that by just relabelling an integer-valued NumericVar's
++dscale field; dscale does not move the decimal point, so that produced sums
++100x too large whenever scale was 2 -- caught by pg_prosupport's own
++differential regression tests against stock sum(), not by anything in core's
++suite, which is why those tests matter and are worth keeping in sync.)
++
++The reason this is not a problem is arithmetic, not cleverness: the final
++function runs once per group (once, full stop, for a plain scalar
++aggregate), while the accumulator above runs once per row. A HashAggregate
++over a million rows and ten thousand groups pays the O(1) per-row mantissa
++extraction a million times and the three-chunk reconstruction ten thousand
++times. Moving cost from the row-count side of that ratio to the group-count
++side is the same trade sum(int8) already makes by accumulating into a bare
++int128 and only building a NumericVar in its own finalfn.
++
++Folding a product: no intermediate Numeric at all
++-----------------------------------------------------
++
++sum(a * b) ordinarily calls numeric_mul() once per row: that allocates a
++result NumericVar, packs it into a Numeric, and hands it to the transition
++function, which promptly unpacks it again to accumulate. Nothing about the
++packed product survives past that one transition call, so the packing was
++pure overhead.
++
++pg_prosupport's numeric_scaled_sum_mul (reached through agg_simplify_hook,
++not through the direct call this file otherwise describes -- core's own
++substitution only ever produces the two-argument numeric_scaled_sum) skips
++building the product Numeric entirely: it extracts each factor's mantissa
++the same way numeric_scaled_mantissa() does, as a plain int64 this time
++(each factor is bounded at 18 digits so its mantissa fits one), and
++accumulates their product directly into the int128 state with
++int128_add_int64_mul_int64() -- the same primitive int8_avg's own transition
++function uses for exactly this shape. One multiply-accumulate against one
++alloc-multiply-pack-unpack: on the measurements in the extension's README,
++this is what turns an 8% end-to-end gain from scale specialisation alone
++into roughly 32% once the product is folded in too.
++
++Zero-cost dispatch: the decision is made once, at plan time
++-----------------------------------------------------------
++
++None of the above would be free if it were decided per row. It is not: the
++substitution -- which aggregate to run at all -- happens once, while the
++query is being planned, in eval_const_expressions_mutator()'s T_Aggref case
++(clauses.c). simplify_sum_numeric_aggref() (numeric.c) looks at the Aggref
++once, proves the argument's precision and scale statically from its typmod,
++and either returns a replacement Aggref naming numeric_scaled_sum or leaves
++the original alone. By the time the plan is executed, there is no branch,
++no runtime type check, no "is this the kind of numeric I can specialise"
++test anywhere in the per-row path -- the executor calls whichever
++transition function the plan says to call, exactly as it would for any other
++aggregate. The cost of deciding is paid once per query (in practice, once
++per plan, since a generic plan is not replanned), not once per row.
++
++This is also why the call is a plain, unconditional function call rather
++than a hook a module installs, unlike the rest of this extension's rewrites
++(agg_simplify_hook, described in the top-level README): there is no
++configuration to consult and nothing to chain, so there is nothing to cost
++beyond the one substitution check itself, and no reason to pay even that
++check through a function pointer instead of a direct call.
++
++Why 1 <= p <= 28 is safe, and why it is checked once
++--------------------------------------------------------
++
++The bound comes from the accumulator, not from the mantissa extraction: at
++p = 28 a mantissa is below 10^28 ~ 2^93, so int128's headroom above that
++(2^127) allows roughly 2^34, about seventeen billion, further additions
++before the accumulator itself could overflow -- the same argument sum(int8)
++relies on when it accumulates into int128 unchecked. This is proven once,
++statically, from the argument's typmod, at the moment the Aggref is
++substituted -- not re-checked on every row the way a runtime overflow guard
++would have to be. The per-row cost of that safety is therefore zero; what
++each row does pay is the exact-fit check inside numeric_scaled_mantissa()
++(does this particular value's digits actually match the scale it was
++declared to have), which is not a safety margin but a promise-keeping check:
++a numeric(p,s) column is supposed to guarantee every value fits, but a value
++can still arrive from an FDW, or out of a cast that bypassed typmod
++enforcement, without honouring it. When that happens the aggregate raises an
++ERROR rather than silently producing a value 10^k off -- correctness is
++still checked per row, but it is a cheap comparison against already-unpacked
++digits, not a fallback to arbitrary-precision arithmetic.
++
++What this file's mechanism does not cover
++---------------------------------------------
++
++Everything above is core's own substitution (patches/pg18-numeric-scaled-sum-
++catalog.patch): sum(numeric) alone, only when the argument's precision and
++scale come from a typmod directly, never from a bare constant (constagg.c's
++rewrite gets first refusal on those; see the top-level README). avg(numeric)
++in every shape, and sum()/avg() over an arithmetic expression rather than a
++plain typmod (a + b, round(a * b, 2), and so on, derived via
++pps_derive_bounds()'s recursion through OpExpr/FuncExpr in numeric_support.c)
++use the identical state and the identical mechanism described here -- the
++same int128 accumulator, the same Horner-scheme mantissa extraction, the
++same once-per-group reconstruction -- but are reached through
++agg_simplify_hook rather than by a direct call, because deriving a scale
++from an expression is not something that is always safe to attempt
++unconditionally the way reading a typmod off a column is.
 diff --git a/src/backend/utils/adt/numeric.c b/src/backend/utils/adt/numeric.c
 index a372237..19401fe 100644
 --- a/src/backend/utils/adt/numeric.c
