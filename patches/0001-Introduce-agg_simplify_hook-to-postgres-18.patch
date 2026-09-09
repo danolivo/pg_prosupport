@@ -1,0 +1,86 @@
+From 778ba8ade37fa169df66cc86dad7efa3f17e0a7a Mon Sep 17 00:00:00 2001
+From: "Andrei V. Lepikhov" <lepihov@gmail.com>
+Date: Wed, 9 Sep 2026 13:21:50 +0200
+Subject: [PATCH] Introduce agg_simplify_hook to postgres 18
+
+---
+ src/backend/optimizer/util/clauses.c | 23 +++++++++++++++++++++++
+ src/include/optimizer/clauses.h      | 21 +++++++++++++++++++++
+ 2 files changed, 44 insertions(+)
+
+diff --git a/src/backend/optimizer/util/clauses.c b/src/backend/optimizer/util/clauses.c
+index 6a6a54498b7..54d6f183392 100644
+--- a/src/backend/optimizer/util/clauses.c
++++ b/src/backend/optimizer/util/clauses.c
+@@ -94,6 +94,14 @@ typedef struct
+ 	List	   *safe_param_ids; /* PARAM_EXEC Param IDs to treat as safe */
+ } max_parallel_hazard_context;
+ 
++/*
++ * Hook for plugins to take over simplification of an Aggref at plan time;
++ * see the comment on agg_simplify_hook_type in optimizer/clauses.h.  NULL
++ * means no plugin is interested, which is the state on a stock server: the
++ * check costs one predicted-not-taken branch per Aggref.
++ */
++agg_simplify_hook_type agg_simplify_hook = NULL;
++
+ /*
+  * Walker context for expression_has_grouping_conflict.  get_eqop is a callback
+  * that returns the equality operator used for grouping.  cb_context is opaque
+@@ -2651,6 +2659,21 @@ eval_const_expressions_mutator(Node *node,
+ 				newexpr->location = expr->location;
+ 				return (Node *) newexpr;
+ 			}
++		case T_Aggref:
++			{
++				node = ece_generic_processing(node);
++
++				if (agg_simplify_hook)
++				{
++					Node	   *newnode;
++
++					newnode = agg_simplify_hook(context->root, (Aggref *) node);
++					if (newnode != NULL)
++						return newnode;
++				}
++
++				return node;
++			}
+ 		case T_OpExpr:
+ 			{
+ 				OpExpr	   *expr = (OpExpr *) node;
+diff --git a/src/include/optimizer/clauses.h b/src/include/optimizer/clauses.h
+index 5935c50ffe1..0c0ee328e58 100644
+--- a/src/include/optimizer/clauses.h
++++ b/src/include/optimizer/clauses.h
+@@ -33,6 +33,27 @@ typedef struct
+  */
+ typedef Oid (*grouping_eqop_callback) (Var *var, void *context);
+ 
++/*
++ * Hook for plugins to take over simplification of an Aggref at plan time.
++ *
++ * eval_const_expressions_mutator() calls this, if set, for every Aggref it
++ * meets, immediately after simplifying the Aggref's own arguments.  The hook
++ * gets the current PlannerInfo and the Aggref itself; it must not modify the
++ * Aggref in place (build a copy if it wants to return a changed one -- see
++ * copyObject()).  Returning NULL leaves the Aggref alone; returning a
++ * non-NULL Node substitutes that node in its place, exactly like any other
++ * eval_const_expressions_mutator() rewrite.
++ *
++ * There is no catalog-driven dispatch here -- unlike a plain function's
++ * SupportRequestSimplify, which core looks up per-function via
++ * pg_proc.prosupport, this hook is a single global entry point that a
++ * loaded module installs in its _PG_init() and that fires for every
++ * Aggref in every query; the hook function itself has to recognise which
++ * aggregate (if any) it wants to touch, from aggref->aggfnoid.
++ */
++typedef Node *(*agg_simplify_hook_type) (PlannerInfo *root, Aggref *aggref);
++extern PGDLLIMPORT agg_simplify_hook_type agg_simplify_hook;
++
+ extern bool contain_agg_clause(Node *clause);
+ 
+ extern bool contain_window_function(Node *clause);
+-- 
+2.55.0
+
