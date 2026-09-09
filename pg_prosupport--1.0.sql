@@ -31,6 +31,20 @@ CREATE FUNCTION pps_scaled_avg_final(internal) RETURNS numeric
 -- only ever put into a plan by the support function; there is no reason to
 -- call them by hand.
 --
+-- The plain-column case -- sum(c) where c is itself numeric(p,s) or a cast,
+-- CASE or domain declaring one -- is no longer this extension's job: as of
+-- patches/pg18-numeric-scaled-sum-catalog.patch, core has its own
+-- pg_catalog.numeric_scaled_sum(numeric, int4) for exactly that, substituted
+-- directly in eval_const_expressions_mutator() before agg_simplify_hook is
+-- even consulted (see simplify_sum_numeric_aggref() in numeric.c).  What
+-- reaches pps_simplify_aggref()'s sum() branch, and so what
+-- numeric_scaled_sum_expr below actually has to serve, is everything core's
+-- direct call declines: an *arithmetic expression* over numeric columns --
+-- sum(a + b), sum(a - b), sum(round(a * b, 2)) -- via pps_derive_bounds()'s
+-- recursion through OpExpr and FuncExpr.  Named _expr, rather than reusing
+-- core's own name, so that \df and EXPLAIN never have to schema-qualify to
+-- tell the two apart.
+--
 -- sspace = 64 is sizeof(NasAggState) plus an aset chunk header, and the C code
 -- carries a StaticAssertDecl that fires if the struct changes size.  The
 -- planner takes the size of a hash table entry from here
@@ -39,7 +53,7 @@ CREATE FUNCTION pps_scaled_avg_final(internal) RETURNS numeric
 -- digit arrays are allocated separately, so it also pays for those chunks and
 -- for the cache misses of chasing the pointers -- 1.17 GB against 467 MB over
 -- three million groups.
-CREATE AGGREGATE numeric_scaled_sum(numeric, int4) (
+CREATE AGGREGATE numeric_scaled_sum_expr(numeric, int4) (
   sfunc        = pps_scaled_accum,
   stype        = internal,
   sspace       = 64,
