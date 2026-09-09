@@ -9,9 +9,15 @@
  * agg_simplify_hook, a single global hook that the patched planner (see
  * patches/) calls for every Aggref it meets.  _PG_init() below installs
  * pps_agg_simplify_hook() there, chaining whatever hook -- if any -- was
- * already in place; numeric_support.c and constagg.c do the actual work,
- * recognising sum(numeric)/avg(numeric) by aggfnoid and declining everything
- * else.
+ * already in place.
+ *
+ * pps_agg_simplify_hook() itself recognises and rewrites nothing.  It is a
+ * fixed sequence of calls, one per rewrite, each living in its own module
+ * (numeric_support.c, constagg.c) with its own GUC and its own decline
+ * logging; the first one to return non-NULL wins.  Nothing here decides
+ * which aggregates a rewrite wants -- that stays entirely inside the module
+ * that owns it, so a third rewrite later means a third call added below, not
+ * the two existing ones being touched.
  *
  * Because the hook is what does the work, and not a pg_proc.prosupport entry
  * that fmgr resolves on demand, the library has to be loaded before planning
@@ -45,16 +51,6 @@ PG_MODULE_MAGIC;
 
 void		_PG_init(void);
 
-/*
- * The off switch.  A rewrite changes the behaviour of a very widely used
- * function for a whole database at once, and the hook is global and
- * installed for as long as the server runs -- there is no equivalent of
- * writing pg_proc.prosupport back to 0 to reach for at three in the morning.
- * This is the way to disable the optimisations in a single session (or a
- * single database, with ALTER DATABASE) without a restart.
- */
-bool		pps_enabled = true;
-
 /* whatever agg_simplify_hook held before we installed ours */
 static agg_simplify_hook_type prev_agg_simplify_hook = NULL;
 
@@ -64,25 +60,37 @@ static agg_simplify_hook_type prev_agg_simplify_hook = NULL;
  * runs before any query of this session is planned, well before
  * pps_agg_simplify_hook() can ever be called.  Until _PG_init() has
  * finished, though, the plan cache must not be touched; see
- * pps_assign_enabled().
+ * pps_assign_numeric_agg() and pps_assign_fold_const_sum().
  */
 static bool pps_ready = false;
 
 /*
  * pps_agg_simplify_hook
- *		The planner's agg_simplify_hook, chaining to whatever was there
- *		before us.
+ *		The planner's agg_simplify_hook: a fixed sequence of independent
+ *		rewrites, chaining to whatever was there before us when none of ours
+ *		applies.
  *
- * All the actual recognising-and-rewriting logic is pps_simplify_aggref()'s;
- * this exists only to fall through to prev_agg_simplify_hook when our own
- * rewrite declines, the standard pattern for a hook more than one loaded
- * module might want.
+ * Each call below is a whole rewrite owned by its own module -- its own
+ * recognition of the aggregate shape, its own GUC, its own pps_decline()
+ * logging -- and this function does not look inside any of them.  They are
+ * tried in a fixed order rather than independently: sum() over a numeric
+ * constant, with both switches on, could equally be eliminated by
+ * pps_simplify_const_sum() or narrowed by pps_simplify_scaled_numeric_agg(),
+ * and eliminating the aggregation outright is strictly the better plan, so
+ * the constant fold goes first and whichever returns non-NULL first wins.
+ * With pps_fold_const_sum off (the default), that case simply falls through
+ * to the second call, unaffected.
  */
 static Node *
 pps_agg_simplify_hook(PlannerInfo *root, Aggref *aggref)
 {
-	Node	   *result = pps_simplify_aggref(root, aggref);
+	Node	   *result;
 
+	result = pps_simplify_const_sum(aggref);
+	if (result != NULL)
+		return result;
+
+	result = pps_simplify_scaled_numeric_agg(root, aggref);
 	if (result != NULL)
 		return result;
 
@@ -90,7 +98,7 @@ pps_agg_simplify_hook(PlannerInfo *root, Aggref *aggref)
 }
 
 /*
- * pps_assign_enabled
+ * pps_assign_numeric_agg
  *		Flush the plan cache when the switch is flipped.
  *
  * Without this the off switch does not switch anything off: a saved generic
@@ -104,7 +112,7 @@ pps_agg_simplify_hook(PlannerInfo *root, Aggref *aggref)
  * The hook runs before the variable is assigned, hence the comparison rather
  * than an unconditional flush.
  *
- * The delicate part is pps_ready.  If pg_prosupport.enabled = off already
+ * The delicate part is pps_ready.  If pg_prosupport.numeric_agg = off already
  * sat in a placeholder GUC when this module loaded -- from postgresql.conf
  * together with shared_preload_libraries, or from an earlier SET in the
  * session together with session_preload_libraries or LOAD --
@@ -116,9 +124,9 @@ pps_agg_simplify_hook(PlannerInfo *root, Aggref *aggref)
  * flush.
  */
 static void
-pps_assign_enabled(bool newval, void *extra)
+pps_assign_numeric_agg(bool newval, void *extra)
 {
-	if (pps_ready && pps_enabled != newval)
+	if (pps_ready && pps_numeric_agg != newval)
 		ResetPlanCache();
 }
 
@@ -133,26 +141,34 @@ pps_assign_fold_const_sum(bool newval, void *extra)
 void
 _PG_init(void)
 {
-	DefineCustomBoolVariable("pg_prosupport.enabled",
-							 "Enable the plan-time aggregate rewrites of pg_prosupport.",
-							 "Turning this off leaves the support functions "
-							 "attached but makes them decline every rewrite, "
-							 "which is the way to disable the optimisations "
-							 "without touching the catalog.",
-							 &pps_enabled,
+	DefineCustomBoolVariable("pg_prosupport.numeric_agg",
+							 "Specialise sum()/avg() over a numeric of bounded precision and scale.",
+							 "This is the rewrite in numeric_support.c: sum()/avg() "
+							 "narrowed to numeric_scaled_sum_expr/numeric_scaled_avg "
+							 "(and the product fold on top of it), whenever the "
+							 "argument's precision and scale are known and small "
+							 "enough.  On by default, like patch 2's core-level "
+							 "substitution for the plain-column case this extends: "
+							 "narrowing an accumulator is not a change of plan "
+							 "shape a DBA needs to opt into.",
+							 &pps_numeric_agg,
 							 true,
 							 PGC_USERSET,
 							 0,
-							 NULL, pps_assign_enabled, NULL);
+							 NULL, pps_assign_numeric_agg, NULL);
 
 	DefineCustomBoolVariable("pg_prosupport.fold_const_sum",
 							 "Replace sum() over a constant argument with a multiplication of count(*).",
 							 "This is the transformation in constagg.c, which "
 							 "removes the aggregation instead of specialising "
-							 "it.  It is switched separately from the rest "
-							 "because it rewrites the query's expression tree.",
+							 "it.  Off by default -- unlike pg_prosupport.numeric_agg, "
+							 "this one changes the shape of the query's expression "
+							 "tree, not just an aggregate's accumulator, so it is "
+							 "opt-in.  It is switched separately from "
+							 "pg_prosupport.numeric_agg because the two rewrites "
+							 "fail in different ways.",
 							 &pps_fold_const_sum,
-							 true,
+							 false,
 							 PGC_USERSET,
 							 0,
 							 NULL, pps_assign_fold_const_sum, NULL);

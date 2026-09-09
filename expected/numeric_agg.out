@@ -157,10 +157,10 @@ EXPLAIN (verbose, costs off)
 -- Param survives constant folding, and nothing fires.
 PREPARE pparam (numeric(18,2)) AS SELECT sum(x) FROM (VALUES ($1)) t(x);
 EXPLAIN (verbose, costs off) EXECUTE pparam ('1.00');
-                         QUERY PLAN                          
--------------------------------------------------------------
+                 QUERY PLAN                 
+--------------------------------------------
  Aggregate
-   Output: (1.00 * (NULLIF(count(*), '0'::bigint))::numeric)
+   Output: numeric_scaled_sum_expr(1.00, 2)
    ->  Result
 (3 rows)
 
@@ -481,7 +481,7 @@ INSERT INTO t_mul VALUES
 	(3,  1.00,  NULL,   1.00, NULL),
 	(4, 'NaN', 1.0000, 'NaN', 1.00),
 	(4,  2.00, 3.0000,  2.00, 3.00);
-SET pg_prosupport.enabled = off;
+SET pg_prosupport.numeric_agg = off;
 CREATE TABLE t_mulref AS
 	SELECT grp,
 		   sum(a * b)::text          AS s1,
@@ -493,7 +493,7 @@ CREATE TABLE t_mulref AS
 		   sum(d * e)::text          AS s7,
 		   sum(a * b * a)::text      AS s8
 	FROM t_mul GROUP BY grp;
-RESET pg_prosupport.enabled;
+RESET pg_prosupport.numeric_agg;
 SELECT count(*) AS mul_mismatches
 FROM t_mulref r
 FULL JOIN (
@@ -608,7 +608,7 @@ DETAIL:  The aggregate was specialised on the declared types of the factors; a r
 INSERT INTO t_ab VALUES (1.25, 3.1234, 7.0123456789),
 						(-0.10, 0.0001, -1.0000000001),
 						(99999999.99, 99999999.9999, 1234567890.0123456789);
-SET pg_prosupport.enabled = off;
+SET pg_prosupport.numeric_agg = off;
 SELECT sum(a * b)::text AS r1, sum(a + b)::text AS r2, sum(a - b)::text AS r3,
 	   sum(-a)::text AS r4, sum(a * b + a)::text AS r5,
 	   sum(a * 1.2)::text AS r6, sum(a - 1)::text AS r7,
@@ -618,7 +618,7 @@ SELECT sum(a * b)::text AS r1, sum(a + b)::text AS r2, sum(a - b)::text AS r3,
 	   sum(trunc(a * b, 2))::text AS r11,
 	   sum(round(a * b))::text AS r12,
 	   sum(round(a, -1))::text AS r13 FROM t_ab \gset
-RESET pg_prosupport.enabled;
+RESET pg_prosupport.numeric_agg;
 SELECT sum(a * b)::text = :'r1' AS mul,
 	   sum(a + b)::text = :'r2' AS add,
 	   sum(a - b)::text = :'r3' AS sub,
@@ -735,7 +735,7 @@ EXPLAIN (verbose, costs off) SELECT sum(v) FILTER (WHERE v > 0) FROM t_ok;
 (4 rows)
 
 -- the off switch
-SET pg_prosupport.enabled = off;
+SET pg_prosupport.numeric_agg = off;
 EXPLAIN (verbose, costs off) SELECT sum(v) FROM t_ok;
              QUERY PLAN             
 ------------------------------------
@@ -745,7 +745,7 @@ EXPLAIN (verbose, costs off) SELECT sum(v) FROM t_ok;
          Output: v
 (4 rows)
 
-RESET pg_prosupport.enabled;
+RESET pg_prosupport.numeric_agg;
 --
 -- Values: the substituted aggregate has to match the stock one in everything,
 -- including the result's dscale and the ordering of special values.
@@ -953,10 +953,10 @@ INSERT INTO t_bulk
 		 ((i * 7919) % 1000000)::numeric / 10000,
 		 ((i * 104729)::numeric * 1000000007) / 10000000000
   FROM generate_series(1, 20000) i;
-SET pg_prosupport.enabled = off;
+SET pg_prosupport.numeric_agg = off;
 CREATE TABLE t_ref AS
   SELECT grp, sum(v) AS s, sum(w) AS sw FROM t_bulk GROUP BY grp;
-RESET pg_prosupport.enabled;
+RESET pg_prosupport.numeric_agg;
 SELECT count(*) AS mismatches
 FROM t_ref r
 FULL JOIN (SELECT grp, sum(v) AS s, sum(w) AS sw FROM t_bulk GROUP BY grp) a
@@ -969,9 +969,9 @@ WHERE r.s::text IS DISTINCT FROM a.s::text
 (1 row)
 
 -- and the same for the sum over the whole table
-SET pg_prosupport.enabled = off;
+SET pg_prosupport.numeric_agg = off;
 SELECT sum(v)::text AS ref FROM t_bulk \gset
-RESET pg_prosupport.enabled;
+RESET pg_prosupport.numeric_agg;
 SELECT sum(v)::text = :'ref' AS matches_stock FROM t_bulk;
  matches_stock 
 ---------------
@@ -980,11 +980,11 @@ SELECT sum(v)::text = :'ref' AS matches_stock FROM t_bulk;
 
 -- avg() over the same data, grouped and ungrouped: the quotient's scale comes
 -- out of select_div_scale(), so a dscale mismatch in our sum would show here
-SET pg_prosupport.enabled = off;
+SET pg_prosupport.numeric_agg = off;
 CREATE TABLE t_avgref AS
   SELECT grp, avg(v) AS a, avg(w) AS aw FROM t_bulk GROUP BY grp;
 SELECT avg(v)::text AS avgref FROM t_bulk \gset
-RESET pg_prosupport.enabled;
+RESET pg_prosupport.numeric_agg;
 SELECT count(*) AS avg_mismatches
 FROM t_avgref r
 FULL JOIN (SELECT grp, avg(v) AS a, avg(w) AS aw FROM t_bulk GROUP BY grp) x
@@ -1057,9 +1057,9 @@ INSERT INTO t_big
               ELSE 9999999999999999.99 END
   FROM generate_series(1, 100000) i;
 ANALYZE t_big;
-SET pg_prosupport.enabled = off;
+SET pg_prosupport.numeric_agg = off;
 SELECT sum(v)::text AS bigref FROM t_big \gset
-RESET pg_prosupport.enabled;
+RESET pg_prosupport.numeric_agg;
 SELECT sum(v)::text = :'bigref' AS big_parallel_matches_stock FROM t_big;
  big_parallel_matches_stock 
 ----------------------------
@@ -1081,9 +1081,9 @@ INSERT INTO t_bigw
 			  ELSE 9876543210987654.3210987654 END
   FROM generate_series(1, 100000) i;
 ANALYZE t_bigw;
-SET pg_prosupport.enabled = off;
+SET pg_prosupport.numeric_agg = off;
 SELECT sum(v)::text AS bigwref FROM t_bigw \gset
-RESET pg_prosupport.enabled;
+RESET pg_prosupport.numeric_agg;
 SELECT sum(v)::text = :'bigwref' AS wide_parallel_matches_stock FROM t_bigw;
  wide_parallel_matches_stock 
 -----------------------------
@@ -1137,7 +1137,7 @@ EXPLAIN (verbose, costs off) EXECUTE pavg;
          Output: v
 (4 rows)
 
-SET pg_prosupport.enabled = off;
+SET pg_prosupport.numeric_agg = off;
 EXPLAIN (verbose, costs off) EXECUTE pavg;
           QUERY PLAN           
 -------------------------------
@@ -1147,7 +1147,7 @@ EXPLAIN (verbose, costs off) EXECUTE pavg;
          Output: v
 (4 rows)
 
-RESET pg_prosupport.enabled;
+RESET pg_prosupport.numeric_agg;
 EXPLAIN (verbose, costs off) EXECUTE pavg;
              QUERY PLAN             
 ------------------------------------
@@ -1189,7 +1189,7 @@ SELECT max(v) FROM t_ok;
 -- do, so there is nothing for a switch to decide).  avg(v) is still ours to
 -- turn off.
 --
-SET pg_prosupport.enabled = off;
+SET pg_prosupport.numeric_agg = off;
 EXPLAIN (verbose, costs off) SELECT sum(v) FROM t_ok;
              QUERY PLAN             
 ------------------------------------
@@ -1208,7 +1208,7 @@ EXPLAIN (verbose, costs off) SELECT avg(v) FROM t_ok;
          Output: v
 (4 rows)
 
-RESET pg_prosupport.enabled;
+RESET pg_prosupport.numeric_agg;
 DROP TABLE t_ok, t_wide, t_w28, t_w29, t_plain, t_int0, t_frac, t_dom, t_dom2,
 		   t_bulk, t_ref, t_big, t_bigw, t_ab, t_avgref, t_mul, t_mulref;
 DROP DOMAIN money18_2;

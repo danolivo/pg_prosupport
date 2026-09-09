@@ -3,11 +3,15 @@
  * constagg.c
  *	  Plan-time removal of sum() over a constant argument.
  *
- * This is a different optimisation from the one in numeric_support.c, and
- * shares nothing with it but the support function they are both reached from.
- * There the aggregate stays and its transition function is made cheaper; here
- * the accumulation disappears altogether, because the answer never depended on
- * the rows in the first place:
+ * This is a different optimisation from the one in numeric_support.c, called
+ * independently and in its own right from pg_prosupport.c's
+ * pps_agg_simplify_hook() -- the two share nothing now but
+ * pps_get_sum_numeric_oid(), a read-only accessor for which aggregate is
+ * pg_catalog.sum(numeric), so this module does not have to keep a second
+ * cache of the same catalog fact.  There the aggregate stays and its
+ * transition function is made cheaper; here the accumulation disappears
+ * altogether, because the answer never depended on the rows in the first
+ * place:
  *
  *		sum(c)  ->  c * NULLIF(count(*), 0)::numeric
  *
@@ -66,16 +70,22 @@
 
 /*
  * The off switch for this transformation alone.  It is separate from
- * pg_prosupport.enabled because the two optimisations fail in
+ * pg_prosupport.numeric_agg because the two optimisations fail in
  * different ways: the specialised aggregates can be wrong about a scale,
  * whereas this one changes the expression tree of a query.  Whoever has to
  * decide at three in the morning which of the two to take out should not have
  * to take out both.
  *
+ * Off by default, unlike pg_prosupport.numeric_agg.  numeric_support.c's
+ * rewrite only ever changes which function accumulates the same aggregate;
+ * this one removes the aggregate from the plan altogether and replaces it
+ * with an equivalent built from count(*) -- a bigger change of plan shape,
+ * and one worth opting into rather than discovering after the fact.
+ *
  * The variable lives here; the GUC is defined in _PG_init() with the others,
  * so that the plan cache is flushed on the same terms.
  */
-bool		pps_fold_const_sum = true;
+bool		pps_fold_const_sum = false;
 
 /*
  * Operator OIDs of pg_catalog."*"(numeric, numeric) and pg_catalog."="(int8,
@@ -146,7 +156,10 @@ pps_const_arg(Aggref *agg)
  * pps_simplify_const_sum
  *		Build the replacement for sum(<numeric constant>), or return NULL.
  *
- * The caller has already established that this really is pg_catalog.sum(numeric).
+ * Called directly from pg_prosupport.c's pps_agg_simplify_hook() for every
+ * Aggref, so unlike before this function establishes for itself, from
+ * pps_get_sum_numeric_oid(), that agg really is pg_catalog.sum(numeric) --
+ * nothing upstream has narrowed that down any more.
  */
 Node *
 pps_simplify_const_sum(Aggref *agg)
@@ -156,6 +169,16 @@ pps_simplify_const_sum(Aggref *agg)
 	NullIfExpr *nullif;
 	FuncExpr   *tonumeric;
 	OpExpr	   *mul;
+
+	/*
+	 * Is this even pg_catalog.sum(numeric)?  Every Aggref in every query
+	 * reaches this function now, so -- exactly as in numeric_support.c's
+	 * equivalent check -- declining anything else is the overwhelmingly
+	 * common case, not a misconfiguration, and there is nothing to log
+	 * about it.
+	 */
+	if (agg->aggfnoid != pps_get_sum_numeric_oid())
+		return NULL;
 
 	if (!pps_fold_const_sum)
 	{

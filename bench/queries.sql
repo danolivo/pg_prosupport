@@ -24,7 +24,7 @@
 
 \set ECHO queries
 
-SET pg_prosupport.enabled = :enabled;
+SET pg_prosupport.numeric_agg = :enabled;
 SET max_parallel_workers_per_gather = 0;
 SET work_mem = '1GB';
 
@@ -114,7 +114,7 @@ RESET max_parallel_workers_per_gather;
 RESET parallel_setup_cost;
 RESET parallel_tuple_cost;
 RESET min_parallel_table_scan_size;
-RESET pg_prosupport.enabled;
+RESET pg_prosupport.numeric_agg;
 
 --
 -- Planning cost, measured separately: twenty-five aggregates, no execution.

@@ -37,7 +37,7 @@ CREATE FUNCTION pps_scaled_avg_final(internal) RETURNS numeric
 -- pg_catalog.numeric_scaled_sum(numeric, int4) for exactly that, substituted
 -- directly in eval_const_expressions_mutator() before agg_simplify_hook is
 -- even consulted (see simplify_sum_numeric_aggref() in numeric.c).  What
--- reaches pps_simplify_aggref()'s sum() branch, and so what
+-- reaches pps_simplify_scaled_numeric_agg()'s sum() branch, and so what
 -- numeric_scaled_sum_expr below actually has to serve, is everything core's
 -- direct call declines: an *arithmetic expression* over numeric columns --
 -- sum(a + b), sum(a - b), sum(round(a * b, 2)) -- via pps_derive_bounds()'s

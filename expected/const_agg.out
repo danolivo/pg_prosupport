@@ -15,6 +15,23 @@ LOAD 'pg_prosupport';
 CREATE TABLE t_const (grp int, v numeric(18,2));
 INSERT INTO t_const SELECT i % 3, i * 1.25 FROM generate_series(1, 9) i;
 CREATE TABLE t_empty (grp int, v numeric(18,2));
+--
+-- pg_prosupport.fold_const_sum is off by default: unlike numeric_agg.sql's
+-- rewrite, which only narrows an accumulator, this one removes the
+-- aggregate from the plan altogether, and that is a bigger change of plan
+-- shape to opt into blindly.  Confirm the default once, then turn it on for
+-- the rest of this file, which exists to exercise this one rewrite.
+--
+EXPLAIN (verbose, costs off) SELECT sum('0'::numeric) FROM t_const;
+                     QUERY PLAN                     
+----------------------------------------------------
+ Aggregate
+   Output: numeric_scaled_sum_expr('0'::numeric, 0)
+   ->  Seq Scan on public.t_const
+         Output: grp, v
+(4 rows)
+
+SET pg_prosupport.fold_const_sum = on;
 -- The shapes 1C emits: a bare literal, and the padded measure column of a
 -- UNION ALL branch that has no value for it.
 EXPLAIN (verbose, costs off) SELECT sum('0'::numeric) FROM t_const;
@@ -146,8 +163,15 @@ EXPLAIN (verbose, costs off) SELECT sum(v) FROM t_const;
 (4 rows)
 
 --
--- The switches.  fold_const_sum takes out this transformation alone and leaves
--- the specialisation in place; enabled takes out both.
+-- The switch.  pg_prosupport.fold_const_sum takes out this transformation
+-- alone -- but pg_prosupport.numeric_agg (see numeric_agg.sql), still on, is
+-- a second, entirely independent rewrite that is equally happy to take a
+-- numeric constant as its argument (a constant's precision and scale are
+-- just as derivable as a column's; see pps_const_bounds() in
+-- numeric_support.c), so sum('0'::numeric) does not fall all the way back to
+-- a plain sum() here -- it falls back one step, to numeric_scaled_sum_expr.
+-- Turning both off (see the values section below) is what gets back to
+-- plain sum().
 --
 SET pg_prosupport.fold_const_sum = off;
 EXPLAIN (verbose, costs off) SELECT sum('0'::numeric) FROM t_const;
@@ -159,23 +183,17 @@ EXPLAIN (verbose, costs off) SELECT sum('0'::numeric) FROM t_const;
          Output: grp, v
 (4 rows)
 
-RESET pg_prosupport.fold_const_sum;
-SET pg_prosupport.enabled = off;
-EXPLAIN (verbose, costs off) SELECT sum('0'::numeric) FROM t_const;
-            QUERY PLAN            
-----------------------------------
- Aggregate
-   Output: sum('0'::numeric)
-   ->  Seq Scan on public.t_const
-         Output: grp, v
-(4 rows)
-
-RESET pg_prosupport.enabled;
+SET pg_prosupport.fold_const_sum = on;
 --
 -- The values.  The rewrite has to reproduce core exactly, dscale included, so
--- the reference is taken with the whole extension switched off.
+-- the reference is taken with both of the extension's rewrites switched off
+-- -- fold_const_sum alone is not enough here, since numeric_support.c's own
+-- rewrite (pg_prosupport.numeric_agg, still on) would otherwise pick up the
+-- very same sum(<constant>) itself and the comparison would validate one
+-- rewrite against the other rather than against real pg_catalog.sum.
 --
-SET pg_prosupport.enabled = off;
+SET pg_prosupport.fold_const_sum = off;
+SET pg_prosupport.numeric_agg = off;
 CREATE TABLE t_constref AS
 	SELECT grp,
 		   sum('0'::numeric)::text						AS s1,
@@ -187,7 +205,8 @@ CREATE TABLE t_constref AS
 		   sum(NULL::numeric)::text						AS s7,
 		   (sum('2.5'::numeric) FILTER (WHERE v > 5))::text AS s8
 	FROM t_const GROUP BY grp;
-RESET pg_prosupport.enabled;
+SET pg_prosupport.fold_const_sum = on;
+SET pg_prosupport.numeric_agg = on;
 SELECT count(*) AS const_mismatches
 FROM t_constref r
 FULL JOIN (

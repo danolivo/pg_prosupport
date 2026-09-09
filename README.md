@@ -47,8 +47,23 @@ Rewrites, where they live, and what governs them:
 | rewrite | where | governed by |
 |---|---|---|
 | `sum(a)` — `a` typmod-derivable → `pg_catalog.numeric_scaled_sum(a, s)` | core, `numeric.c` (**patch 2**) | nothing; always on, no extension needed |
-| `sum(c)` for a constant `c` → `c * NULLIF(count(*), 0)::numeric`; the aggregation disappears | `constagg.c` | `pg_prosupport.fold_const_sum` |
-| `avg(a)` typmod-derivable, or `sum(a)`/`avg(a)` derivable only through arithmetic (`a+b`, `round(a*b,2)`, …) → `numeric_scaled_avg`/`numeric_scaled_sum_expr` | `numeric_support.c`, `numeric_agg.c` | `pg_prosupport.enabled` |
+| `avg(a)` typmod-derivable, or `sum(a)`/`avg(a)` derivable only through arithmetic (`a+b`, `round(a*b,2)`, …) → `numeric_scaled_avg`/`numeric_scaled_sum_expr` | `numeric_support.c`, `numeric_agg.c` | `pg_prosupport.numeric_agg` — **on** by default |
+| `sum(c)` for a constant `c` → `c * NULLIF(count(*), 0)::numeric`; the aggregation disappears | `constagg.c` | `pg_prosupport.fold_const_sum` — **off** by default |
+
+The two extension-level rewrites are independent: `pg_prosupport.c`'s
+`pps_agg_simplify_hook()` is a fixed sequence of two calls, one per module,
+each recognising its own aggregate shape and consulting only its own GUC --
+not one nested inside the other, and not a single switch governing both.
+`pg_prosupport.numeric_agg` only narrows which function accumulates an
+aggregate that was going to run anyway, the same idea patch 2 already applies
+to a plain `sum(column)` in core with no switch at all, so it defaults to on.
+`pg_prosupport.fold_const_sum` removes the aggregate from the plan outright,
+a bigger change of plan shape, so it defaults to off and is opt-in. When both
+are on and a query is `sum()` over a numeric constant -- the one shape either
+could take -- the constant fold is tried first and wins, since eliminating
+the aggregation is strictly better than merely narrowing it; with
+`fold_const_sum` off (the default), that same query falls through to
+`numeric_agg` instead, one step less thorough but still on.
 
 Grouped aggregation over a plain column: 42–52% off the time, 68–70% off the
 hash-table memory, and the HashAgg spill point three times further out.
@@ -145,9 +160,9 @@ about a rewrite that is never wrong.)
 There is no equivalent of writing `pg_proc.prosupport` back to zero to detach
 the extension in one session while it stays installed elsewhere — the hook,
 once loaded, applies to every database in the cluster (or every session that
-loads it, with `session_preload_libraries`/`LOAD`). `SET pg_prosupport.enabled
+loads it, with `session_preload_libraries`/`LOAD`). `SET pg_prosupport.numeric_agg
 = off` (see Disabling, below) is the per-session and per-database way to stop
-the rewrites without touching how the library is loaded, and `DROP EXTENSION
+that rewrite without touching how the library is loaded, and `DROP EXTENSION
 pg_prosupport;` can be run at any time, in any order, without special care:
 nothing outside `pg_depend`'s own bookkeeping points at the extension's
 objects, since none of this is reached through a catalog field.
@@ -343,9 +358,12 @@ DETAIL:  The aggregate was specialised on the argument's declared type;
          a row source supplied a value outside that declaration.
 ```
 
-For `avg()`, or for `sum()` over an arithmetic expression -- the extension's
-own rewrites -- `SET pg_prosupport.enabled = off` is the immediate cure,
-before going after the row source.
+For `avg()`, or for `sum()` over an arithmetic expression -- both reached
+through `pg_prosupport.numeric_agg` -- `SET pg_prosupport.numeric_agg = off`
+is the immediate cure, before going after the row source. If the error came
+from the constant fold instead (`sum()` over a numeric literal, with
+`pg_prosupport.fold_const_sum` on), `SET pg_prosupport.fold_const_sum = off`
+is the one to reach for.
 
 For a plain `sum(column)`, there is no session-level switch: patch 2 put that
 substitution in core, unconditionally, on the premise that it is never wrong
@@ -362,21 +380,28 @@ rewrites (`avg()`, `sum()`/`avg()` over an arithmetic expression, the product
 fold, and the constant fold). `sum(column)` over a plain typmod is core's
 doing (patch 2) and none of these switches reach it; see above.
 
-**Per session or per database** — GUCs, no superuser needed:
+**Per session or per database** — GUCs, no superuser needed. Two switches,
+each governing exactly one of `pps_agg_simplify_hook()`'s two calls (see the
+table above) and neither one reaching into the other:
 
 ```sql
-SET pg_prosupport.enabled = off;                -- the extension's rewrites, this session
-SET pg_prosupport.fold_const_sum = off;         -- only sum() over a constant
-ALTER DATABASE mydb SET pg_prosupport.enabled = off;
+SET pg_prosupport.numeric_agg = off;            -- avg(), and sum()/avg() over an expression; on by default
+SET pg_prosupport.fold_const_sum = off;         -- only sum() over a constant; off by default
+ALTER DATABASE mydb SET pg_prosupport.numeric_agg = off;
 ```
 
 Either of them flushes the plan cache in the session that runs it, so it takes
 effect immediately there, including for already-saved prepared statements. Other
 backends pick it up when they next set it themselves.
 
-They are separate switches because the two rewrites fail in different ways: the
-specialised aggregates can be wrong about a scale, whereas the constant rewrite
-changes the expression tree of a query.
+They are separate switches because the two rewrites fail in different ways --
+the specialised aggregates can be wrong about a scale, whereas the constant
+rewrite changes the expression tree of a query -- and because they default
+differently: `numeric_agg` only narrows an accumulator, the same kind of
+change patch 2 already makes in core with no switch at all, so it is on by
+default; `fold_const_sum` removes the aggregate from the plan outright, which
+is worth opting into rather than discovering after the fact, so it defaults
+to off.
 
 **Entirely** — remove `pg_prosupport` from `shared_preload_libraries` (or
 `session_preload_libraries`) and restart/reconnect; a session that loaded it

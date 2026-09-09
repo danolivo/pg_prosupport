@@ -4,12 +4,15 @@
  *	  Plan-time substitution of specialised aggregates for sum(numeric) and
  *	  avg(numeric).
  *
- * pg_prosupport.c installs pps_simplify_aggref() below as the planner's
- * agg_simplify_hook (see optimizer/clauses.h): the hook is called once for
- * every Aggref in every query, and it is this function's job to recognise
- * sum(numeric)/avg(numeric) by aggfnoid and, if the input can be shown to be
- * narrow enough, return a new Aggref carrying a different aggfnoid.
- * Anything else is declined immediately.
+ * pg_prosupport.c's pps_agg_simplify_hook() calls pps_simplify_scaled_numeric_agg()
+ * below once for every Aggref in every query, one of a fixed sequence of
+ * independent rewrites (see that function's own comment); it is this
+ * function's job to recognise sum(numeric)/avg(numeric) by aggfnoid and, if
+ * the input can be shown to be narrow enough, return a new Aggref carrying a
+ * different aggfnoid.  Anything else is declined immediately.  This module
+ * owns one GUC, pg_prosupport.numeric_agg (on by default), that gates this
+ * rewrite alone -- constagg.c's constant fold is a separate rewrite behind a
+ * separate switch, no longer reached from here.
  *
  * The proof is static.  It comes either from the argument's declared typmod or
  * from arithmetic over declared operands (see pps_derive_bounds): at
@@ -58,6 +61,17 @@
 #if PG_VERSION_NUM < 150000
 #error "pg_prosupport requires PostgreSQL 15 or later (numeric typmod encoding)"
 #endif
+
+/*
+ * The off switch for this rewrite alone (GUC pg_prosupport.numeric_agg,
+ * defined in pg_prosupport.c's _PG_init() so that both this and
+ * constagg.c's pps_fold_const_sum flush the plan cache on the same terms).
+ * On by default: narrowing an accumulator is never a change of plan shape a
+ * DBA needs to opt into, only ever a change of which numeric_scaled_*
+ * function runs the accumulation, and this extends the same idea patch 2
+ * already applies to plain sum(column) in core without a switch at all.
+ */
+bool		pps_numeric_agg = true;
 
 /* the mantissa fits in int128 and the accumulator holds ~1.7e10 addends */
 #define PPS_MAX_PRECISION	28
@@ -194,6 +208,29 @@ pps_load_oids(void)
 			 "in this database");
 
 	return pps_oids_ok;
+}
+
+/*
+ * pps_get_sum_numeric_oid
+ *		The OID of pg_catalog.sum(numeric), for constagg.c's own use.
+ *
+ * constagg.c's rewrite needs to know, independently of this module's switch
+ * and independently of whether the specialised aggregates exist, whether a
+ * given Aggref is pg_catalog.sum(numeric) at all -- agg_simplify_hook is
+ * called for every Aggref, and constagg.c is now reached directly from the
+ * hook rather than only after this module has already made that check.
+ * Rather than keep a second, independently invalidated cache of the same
+ * fact, it borrows this one: pps_load_oids() resolves and caches
+ * pps_sum_numeric_oid unconditionally, before it even looks at whether the
+ * extension's own aggregates exist, so this is just that cache with an
+ * accessor.
+ */
+Oid
+pps_get_sum_numeric_oid(void)
+{
+	pps_load_oids();
+
+	return pps_sum_numeric_oid;
 }
 
 /*
@@ -548,13 +585,20 @@ pps_scale_const(int value, AttrNumber resno)
 }
 
 /*
- * pps_simplify_aggref
- *		The whole rewrite.  Installed as the planner's agg_simplify_hook (see
- *		pg_prosupport.c's _PG_init()) and called once for every Aggref the
- *		planner meets, so the first thing it does is decide, from aggfnoid
- *		alone, whether it has any business with this one at all.
+ * pps_simplify_scaled_numeric_agg
+ *		The scale-specialisation rewrite alone: sum(numeric)/avg(numeric)
+ *		narrowed to a bounded accumulator, including the product fold.
+ *		Called once for every Aggref the planner meets (see
+ *		pps_agg_simplify_hook() in pg_prosupport.c), so the first thing it
+ *		does is decide, from aggfnoid alone, whether it has any business with
+ *		this one at all.
  *
- * Returns the replacement node, or NULL to leave the aggregate alone.
+ * Returns the replacement node, or NULL to leave the aggregate alone.  A
+ * constant argument is not treated specially here any more -- see
+ * constagg.c for the rewrite that used to be tried first for that shape;
+ * this function is tried after it (see pps_agg_simplify_hook()) and simply
+ * narrows the accumulator for a constant the same way it would for a column,
+ * whenever constagg.c's own rewrite is off or declines.
  *
  * root is unused today -- there is nothing here that needs the planner's
  * infrastructure beyond the Aggref itself -- but it is part of
@@ -563,7 +607,7 @@ pps_scale_const(int value, AttrNumber resno)
  * belongs to, beyond the plain agglevelsup test below) would want it.
  */
 Node *
-pps_simplify_aggref(struct PlannerInfo *root, Aggref *agg)
+pps_simplify_scaled_numeric_agg(struct PlannerInfo *root, Aggref *agg)
 {
 	TargetEntry *tle;
 	Node	   *lhs;
@@ -574,8 +618,6 @@ pps_simplify_aggref(struct PlannerInfo *root, Aggref *agg)
 				s2;
 	Oid			newfn;
 	Aggref	   *newagg;
-	Node	   *folded;
-	bool		is_sum;
 	bool		scaled_ok;
 
 	/*
@@ -609,42 +651,21 @@ pps_simplify_aggref(struct PlannerInfo *root, Aggref *agg)
 	 * function at all any more.
 	 */
 	if (agg->aggfnoid == pps_sum_numeric_oid)
-	{
-		is_sum = true;
 		newfn = pps_scaled_sum_expr_oid;
-	}
 	else if (agg->aggfnoid == pps_avg_numeric_oid)
-	{
-		is_sum = false;
 		newfn = pps_scaled_avg_oid;
-	}
 	else
 		return NULL;
 
 	/*
-	 * The off switch, checked here rather than by the caller, so that it
-	 * gates both rewrites below (the constant fold and the scale
-	 * specialisation) with a single test, on exactly the Aggrefs it is
-	 * meaningful to log about.
+	 * The off switch for this rewrite alone -- constagg.c's constant fold has
+	 * already had its own turn by the time pps_agg_simplify_hook() calls this
+	 * function; see its comment.
 	 */
-	if (!pps_enabled)
+	if (!pps_numeric_agg)
 	{
-		pps_decline(agg->aggfnoid, "pg_prosupport.enabled is off");
+		pps_decline(agg->aggfnoid, "pg_prosupport.numeric_agg is off");
 		return NULL;
-	}
-
-	/*
-	 * A constant argument is the one case where the aggregation does not have
-	 * to happen at all, so it is tried before any specialisation.  constagg.c
-	 * owns that transformation, its conditions and its switch, and returns
-	 * NULL whenever it does not apply.
-	 */
-	if (is_sum)
-	{
-		folded = pps_simplify_const_sum(agg);
-
-		if (folded != NULL)
-			return folded;
 	}
 
 	/* everything below replaces the aggregate with one of ours */
