@@ -1,17 +1,18 @@
-src/backend/utils/adt/README.numeric_scaled_sum
+contrib/pg_prosupport/README.bounded_numeric_agg
 
-Scaled numeric aggregates
+Bounded numeric aggregates
 ==========================
 
-This file documents the mechanism behind numeric_scaled_sum(numeric, int4)
-and its relatives (numeric_scaled_avg, and pg_prosupport's own
-numeric_scaled_sum_expr / numeric_scaled_sum_mul / numeric_scaled_avg_mul,
-built the same way but reached through agg_simplify_hook instead of the
-direct call described here). It exists because "why is this faster" has more
-than one answer, and none of them is "it's written in C" -- sum(numeric) is
-already written in C. The wins are structural, and each one is independent
-of the others: removing any single one of them gives some of the benefit
-back.
+This file documents the mechanism behind bounded_numeric_sum,
+bounded_numeric_sum_mul, bounded_numeric_avg and bounded_numeric_avg_mul --
+the aggregates pg_prosupport substitutes for sum(numeric)/avg(numeric)
+through agg_simplify_hook (see the top-level README for how and when the
+substitution fires; this file is only about what the substituted aggregate
+does differently and why that is faster). It exists because "why is this
+faster" has more than one answer, and none of them is "it's written in C" --
+sum(numeric) is already written in C. The wins are structural, and each one
+is independent of the others: removing any single one of them gives some of
+the benefit back.
 
 The problem with sum(numeric)
 ------------------------------
@@ -44,7 +45,7 @@ single input row, not just once per group or once per query:
 
 hash_agg_entry_size() -- what plans the spill point of a HashAggregate --
 takes the size of one group's transition state from aggtransspace in
-pg_aggregate.dat. For sum(numeric)/avg(numeric) that number describes a
+pg_prosupport--1.0.sql. For sum(numeric)/avg(numeric) that number describes a
 struct whose real footprint, digit buffers included, is larger and less
 predictable than the declared value; the planner's estimate of how many
 groups fit in work_mem is accordingly optimistic, and a query that looked
@@ -53,22 +54,22 @@ like it would stay in memory spills.
 The state: one cache line, no pointers
 ----------------------------------------
 
-NumericScaledAggState (numeric.c) replaces all of that with:
+NasAggState (numeric_agg.c) replaces all of that with:
 
-    typedef struct NumericScaledAggState
+    typedef struct NasAggState
     {
-        int128      sumX;         /* sum of mantissas at scale "scale" */
+        INT128      sumX;         /* sum of mantissas at scale "scale" */
         int64       N;
         int64       NaNcount;
         int64       pInfcount;
         int64       nInfcount;
         int32       scale;
-    } NumericScaledAggState;
+    } NasAggState;
 
 Fifty-six bytes (checked by a StaticAssertDecl, so a change here that isn't
-matched in pg_aggregate.dat's aggtransspace fails the build, not silently
+matched in pg_prosupport--1.0.sql's sspace fails the build, not silently
 skews planning), no field that is a pointer to something else. Accumulating
-a value is one int128 addition. There is no repalloc, no digit array, no
+a value is one INT128 addition. There is no repalloc, no digit array, no
 detoast-then-reparse of an intermediate NumericVar for the running total --
 the total lives entirely inside the struct itself, and the struct never
 grows.
@@ -91,47 +92,52 @@ show up in aggtransspace at all -- it shows up as cache misses, and it is why
 the measured win is larger than the raw byte-count difference alone would
 predict.
 
-Where the mantissa comes from: no intermediate Numeric
----------------------------------------------------------
+Where the mantissa comes from: no intermediate Numeric, no NumericVar either
+-----------------------------------------------------------------------------
 
-Accumulating an int128 requires turning the input Numeric into "the value,
+Accumulating an INT128 requires turning the input Numeric into "the value,
 shifted by scale decimal places, as an integer" -- the mantissa. The obvious
 way to get that is arithmetic: multiply the numeric by 10^scale using the
 existing numeric_mul() machinery, then convert the (now integral) result to
 an integer. That would still cost a full NumericVar allocation and a real
-multiplication per row, defeating the point.
+multiplication per row, defeating the point. A gentler-looking shortcut --
+unpack the Numeric into a NumericVar via init_var_from_num() and read its
+digits from there -- still copies nothing but still pays for the unpacking
+step and its bookkeeping.
 
-numeric_scaled_mantissa() (numeric.c) does not do arithmetic on Numeric
-values at all. It reads the digit array PostgreSQL already unpacked --
-NumericVar's ndigits/weight/digits, reached via the existing
-init_var_from_num(), which does not copy or allocate, it just points into
-the Numeric that is already in memory -- and runs a Horner-scheme reduction
-directly over those base-10000 digits into a native int128:
+pps_get_bounded_int128() (numeric_agg.c) does neither. It reads straight off
+the Numeric's own packed on-disk representation -- the digit array inside
+the varlena's union NumericChoice, reached through this module's own
+PPS_NDIGITS()/PPS_WEIGHT()/PPS_DIGITS() macros, which do not copy or
+allocate, they just index into bytes that are already in memory -- and runs
+a Horner-scheme reduction directly over those base-10000 digits into a
+native INT128:
 
     m = 0;
     for each digit d in the value, most significant first:
         m = m * NBASE + d;
 
 with one correction for the difference between the value's own stored scale
-and the target scale (a single multiply or an exact-division check by a
-power of ten below NBASE, since the two scales can only ever differ by fewer
-than four decimal digits -- the rest of the alignment falls out of the
-Horner loop itself). This is arithmetic on machine integers using the digits
+and the target scale (a single multiply, or an exact-division check by a
+power of ten below NBASE for the common case where the value's digits run
+past the target scale -- since the two scales can only ever differ by fewer
+than four decimal digits, the rest of the alignment falls out of the Horner
+loop itself). This is arithmetic on machine integers using the digits
 PostgreSQL already has in hand, not a second numeric value built and thrown
-away.
+away, and not even a NumericVar's worth of bookkeeping around them.
 
 The precision bound (see below) exists precisely so this loop cannot
-overflow: every partial product stays under 10^28, comfortably inside int128
+overflow: every partial product stays under 10^28, comfortably inside INT128
 regardless of how many digits are left to fold in.
 
 Reconstruction happens once per group, not once per row
 ------------------------------------------------------------
 
-The inverse operation -- turning the accumulated int128 mantissa back into a
-NUMERIC, in numeric_scaled_sum_final() -- is comparatively expensive: it
-splits the mantissa into three 18-digit chunks and rebuilds the value through
-three calls to int64_div_fast_to_numeric() plus two numeric_add_opt_error()
-calls, because that is the only way to reintroduce the correct weight/dscale
+The inverse operation -- turning the accumulated INT128 mantissa back into a
+NUMERIC, in pps_bounded_sum_final() -- is comparatively expensive: it splits
+the mantissa into three 18-digit chunks and rebuilds the value through three
+calls to int64_div_fast_to_numeric() plus two numeric_add_opt_error() calls,
+because that is the only way to reintroduce the correct weight/dscale
 without a bespoke 128-bit-aware division routine. (An early version of this
 code tried to skip that by just relabelling an integer-valued NumericVar's
 dscale field; dscale does not move the decimal point, so that produced sums
@@ -157,18 +163,16 @@ function, which promptly unpacks it again to accumulate. Nothing about the
 packed product survives past that one transition call, so the packing was
 pure overhead.
 
-pg_prosupport's numeric_scaled_sum_mul (reached through agg_simplify_hook,
-not through the direct call this file otherwise describes -- core's own
-substitution only ever produces the two-argument numeric_scaled_sum) skips
-building the product Numeric entirely: it extracts each factor's mantissa
-the same way numeric_scaled_mantissa() does, as a plain int64 this time
-(each factor is bounded at 18 digits so its mantissa fits one), and
-accumulates their product directly into the int128 state with
-int128_add_int64_mul_int64() -- the same primitive int8_avg's own transition
-function uses for exactly this shape. One multiply-accumulate against one
-alloc-multiply-pack-unpack: on the measurements in the extension's README,
-this is what turns an 8% end-to-end gain from scale specialisation alone
-into roughly 32% once the product is folded in too.
+bounded_numeric_sum_mul (sfunc pps_bounded_accum_mul) skips building the
+product Numeric entirely: it extracts each factor's mantissa the same way
+pps_get_bounded_int128() does, as a plain int64 this time (each factor is
+bounded at 18 digits so its mantissa fits one), and accumulates their
+product directly into the INT128 state with int128_add_int64_mul_int64() --
+the same primitive int8_avg's own transition function uses for exactly this
+shape. One multiply-accumulate against one alloc-multiply-pack-unpack: on
+the measurements in the extension's README, this is what turns an 8%
+end-to-end gain from scale specialisation alone into roughly 32% once the
+product is folded in too.
 
 Zero-cost dispatch: the decision is made once, at plan time
 -----------------------------------------------------------
@@ -176,57 +180,46 @@ Zero-cost dispatch: the decision is made once, at plan time
 None of the above would be free if it were decided per row. It is not: the
 substitution -- which aggregate to run at all -- happens once, while the
 query is being planned, in eval_const_expressions_mutator()'s T_Aggref case
-(clauses.c). simplify_sum_numeric_aggref() (numeric.c) looks at the Aggref
-once, proves the argument's precision and scale statically from its typmod,
-and either returns a replacement Aggref naming numeric_scaled_sum or leaves
-the original alone. By the time the plan is executed, there is no branch,
-no runtime type check, no "is this the kind of numeric I can specialise"
-test anywhere in the per-row path -- the executor calls whichever
-transition function the plan says to call, exactly as it would for any other
-aggregate. The cost of deciding is paid once per query (in practice, once
-per plan, since a generic plan is not replanned), not once per row.
+(patched into clauses.c; see the top-level README). agg_simplify_hook calls
+pg_prosupport's own hook, which calls pps_simplify_bounded_numeric_agg()
+(numeric_support.c): it looks at the Aggref once, proves the argument's
+precision and scale statically -- from a column's typmod, from a cast, CASE
+or domain, or by walking an arithmetic expression via pps_derive_bounds() --
+and either returns a replacement Aggref naming one of the four aggregates
+above or leaves the original alone. By the time the plan is executed, there
+is no branch, no runtime type check, no "is this the kind of numeric I can
+specialise" test anywhere in the per-row path -- the executor calls
+whichever transition function the plan says to call, exactly as it would for
+any other aggregate. The cost of deciding is paid once per query (in
+practice, once per plan, since a generic plan is not replanned), not once
+per row.
 
-This is also why the call is a plain, unconditional function call rather
-than a hook a module installs, unlike the rest of this extension's rewrites
-(agg_simplify_hook, described in the top-level README): there is no
-configuration to consult and nothing to chain, so there is nothing to cost
-beyond the one substitution check itself, and no reason to pay even that
-check through a function pointer instead of a direct call.
+Unlike the state and the mantissa arithmetic described above, this decision
+step does have a configuration to consult and a chain to fall through to --
+pg_prosupport.bounded_numeric_agg, and the possibility that some other
+loaded module's hook runs next -- because unlike "is this loop safe from
+overflow", "should this rewrite even be attempted this session" is a
+question the state itself cannot answer. See the top-level README for that
+part.
 
 Why 1 <= p <= 28 is safe, and why it is checked once
 --------------------------------------------------------
 
 The bound comes from the accumulator, not from the mantissa extraction: at
-p = 28 a mantissa is below 10^28 ~ 2^93, so int128's headroom above that
+p = 28 a mantissa is below 10^28 ~ 2^93, so INT128's headroom above that
 (2^127) allows roughly 2^34, about seventeen billion, further additions
 before the accumulator itself could overflow -- the same argument sum(int8)
 relies on when it accumulates into int128 unchecked. This is proven once,
-statically, from the argument's typmod, at the moment the Aggref is
-substituted -- not re-checked on every row the way a runtime overflow guard
-would have to be. The per-row cost of that safety is therefore zero; what
-each row does pay is the exact-fit check inside numeric_scaled_mantissa()
-(does this particular value's digits actually match the scale it was
-declared to have), which is not a safety margin but a promise-keeping check:
-a numeric(p,s) column is supposed to guarantee every value fits, but a value
-can still arrive from an FDW, or out of a cast that bypassed typmod
-enforcement, without honouring it. When that happens the aggregate raises an
-ERROR rather than silently producing a value 10^k off -- correctness is
-still checked per row, but it is a cheap comparison against already-unpacked
-digits, not a fallback to arbitrary-precision arithmetic.
-
-What this file's mechanism does not cover
----------------------------------------------
-
-Everything above is core's own substitution (patches/pg18-numeric-scaled-sum-
-catalog.patch): sum(numeric) alone, only when the argument's precision and
-scale come from a typmod directly, never from a bare constant (constagg.c's
-rewrite gets first refusal on those; see the top-level README). avg(numeric)
-in every shape, and sum()/avg() over an arithmetic expression rather than a
-plain typmod (a + b, round(a * b, 2), and so on, derived via
-pps_derive_bounds()'s recursion through OpExpr/FuncExpr in numeric_support.c)
-use the identical state and the identical mechanism described here -- the
-same int128 accumulator, the same Horner-scheme mantissa extraction, the
-same once-per-group reconstruction -- but are reached through
-agg_simplify_hook rather than by a direct call, because deriving a scale
-from an expression is not something that is always safe to attempt
-unconditionally the way reading a typmod off a column is.
+statically, from the argument's typmod (or from the arithmetic expression it
+is derived through), at the moment the Aggref is substituted -- not
+re-checked on every row the way a runtime overflow guard would have to be.
+The per-row cost of that safety is therefore zero; what each row does pay is
+the exact-fit check inside pps_get_bounded_int128() (does this particular
+value's digits actually match the scale it was specialised on), which is not
+a safety margin but a promise-keeping check: a numeric(p,s) column is
+supposed to guarantee every value fits, but a value can still arrive from an
+FDW, or out of a cast that bypassed typmod enforcement, without honouring
+it. When that happens the aggregate raises an ERROR rather than silently
+producing a value 10^k off -- correctness is still checked per row, but it
+is a cheap comparison against already-unpacked digits, not a fallback to
+arbitrary-precision arithmetic.

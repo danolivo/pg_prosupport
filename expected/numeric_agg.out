@@ -22,47 +22,47 @@ CREATE TABLE t_dom   (v money18);
 CREATE DOMAIN money18_2 AS money18;
 CREATE TABLE t_dom2  (v money18_2);
 EXPLAIN (verbose, costs off) SELECT sum(v) FROM t_ok;
-             QUERY PLAN             
-------------------------------------
+             QUERY PLAN              
+-------------------------------------
  Aggregate
-   Output: numeric_scaled_sum(v, 2)
+   Output: bounded_numeric_sum(v, 2)
    ->  Seq Scan on public.t_ok
          Output: v
 (4 rows)
 
 EXPLAIN (verbose, costs off) SELECT sum(v) FROM t_int0;
-             QUERY PLAN             
-------------------------------------
+             QUERY PLAN              
+-------------------------------------
  Aggregate
-   Output: numeric_scaled_sum(v, 0)
+   Output: bounded_numeric_sum(v, 0)
    ->  Seq Scan on public.t_int0
          Output: v
 (4 rows)
 
 EXPLAIN (verbose, costs off) SELECT sum(v) FROM t_frac;
-             QUERY PLAN              
--------------------------------------
+              QUERY PLAN              
+--------------------------------------
  Aggregate
-   Output: numeric_scaled_sum(v, 18)
+   Output: bounded_numeric_sum(v, 18)
    ->  Seq Scan on public.t_frac
          Output: v
 (4 rows)
 
 -- A domain over numeric(18,2): substituted, with the typmod taken from the domain
 EXPLAIN (verbose, costs off) SELECT sum(v) FROM t_dom;
-                  QUERY PLAN                   
------------------------------------------------
+                   QUERY PLAN                   
+------------------------------------------------
  Aggregate
-   Output: numeric_scaled_sum((v)::numeric, 2)
+   Output: bounded_numeric_sum((v)::numeric, 2)
    ->  Seq Scan on public.t_dom
          Output: v
 (4 rows)
 
 EXPLAIN (verbose, costs off) SELECT sum(v) FROM t_dom2;
-                  QUERY PLAN                   
------------------------------------------------
+                   QUERY PLAN                   
+------------------------------------------------
  Aggregate
-   Output: numeric_scaled_sum((v)::numeric, 2)
+   Output: bounded_numeric_sum((v)::numeric, 2)
    ->  Seq Scan on public.t_dom2
          Output: v
 (4 rows)
@@ -75,19 +75,19 @@ SELECT sum(v) FROM (VALUES ('1.005'::money18_2), ('2.00')) x(v);
 
 -- 19 <= p <= 28 uses the same aggregate: the mantissa is in int128 anyway
 EXPLAIN (verbose, costs off) SELECT sum(v) FROM t_wide;
-             QUERY PLAN             
-------------------------------------
+             QUERY PLAN              
+-------------------------------------
  Aggregate
-   Output: numeric_scaled_sum(v, 2)
+   Output: bounded_numeric_sum(v, 2)
    ->  Seq Scan on public.t_wide
          Output: v
 (4 rows)
 
 EXPLAIN (verbose, costs off) SELECT sum(v) FROM t_w28;
-             QUERY PLAN              
--------------------------------------
+              QUERY PLAN              
+--------------------------------------
  Aggregate
-   Output: numeric_scaled_sum(v, 20)
+   Output: bounded_numeric_sum(v, 20)
    ->  Seq Scan on public.t_w28
          Output: v
 (4 rows)
@@ -117,19 +117,19 @@ EXPLAIN (verbose, costs off) SELECT sum(v) FROM t_plain;
 -- carry the required dscale.
 EXPLAIN (verbose, costs off)
   SELECT sum(CASE WHEN v > 0 THEN v ELSE v END) FROM t_ok;
-                                   QUERY PLAN                                    
----------------------------------------------------------------------------------
+                                    QUERY PLAN                                    
+----------------------------------------------------------------------------------
  Aggregate
-   Output: numeric_scaled_sum(CASE WHEN (v > '0'::numeric) THEN v ELSE v END, 2)
+   Output: bounded_numeric_sum(CASE WHEN (v > '0'::numeric) THEN v ELSE v END, 2)
    ->  Seq Scan on public.t_ok
          Output: v
 (4 rows)
 
 EXPLAIN (verbose, costs off) SELECT sum(coalesce(v, v)) FROM t_ok;
-                   QUERY PLAN                    
--------------------------------------------------
+                    QUERY PLAN                    
+--------------------------------------------------
  Aggregate
-   Output: numeric_scaled_sum(COALESCE(v, v), 2)
+   Output: bounded_numeric_sum(COALESCE(v, v), 2)
    ->  Seq Scan on public.t_ok
          Output: v
 (4 rows)
@@ -157,10 +157,10 @@ EXPLAIN (verbose, costs off)
 -- Param survives constant folding, and nothing fires.
 PREPARE pparam (numeric(18,2)) AS SELECT sum(x) FROM (VALUES ($1)) t(x);
 EXPLAIN (verbose, costs off) EXECUTE pparam ('1.00');
-                 QUERY PLAN                 
---------------------------------------------
+               QUERY PLAN               
+----------------------------------------
  Aggregate
-   Output: numeric_scaled_sum_expr(1.00, 2)
+   Output: bounded_numeric_sum(1.00, 2)
    ->  Result
 (3 rows)
 
@@ -198,76 +198,76 @@ DEALLOCATE pparam;
 CREATE TABLE t_ab (a numeric(10,2), b numeric(12,4), c numeric(20,10));
 -- 10 + 12 = 22 digits, scale 2 + 4 = 6
 EXPLAIN (verbose, costs off) SELECT sum(a * b) FROM t_ab;
-                  QUERY PLAN                  
-----------------------------------------------
+                  QUERY PLAN                   
+-----------------------------------------------
  Aggregate
-   Output: numeric_scaled_sum_mul(a, b, 2, 4)
+   Output: bounded_numeric_sum_mul(a, b, 2, 4)
    ->  Seq Scan on public.t_ab
          Output: a, b, c
 (4 rows)
 
 -- max(8,8) + 1 + 4 = 13 digits, scale max(2,4) = 4
 EXPLAIN (verbose, costs off) SELECT sum(a + b) FROM t_ab;
-                  QUERY PLAN                   
------------------------------------------------
+                QUERY PLAN                 
+-------------------------------------------
  Aggregate
-   Output: numeric_scaled_sum_expr((a + b), 4)
+   Output: bounded_numeric_sum((a + b), 4)
    ->  Seq Scan on public.t_ab
          Output: a, b, c
 (4 rows)
 
 EXPLAIN (verbose, costs off) SELECT sum(a - b) FROM t_ab;
-                  QUERY PLAN                   
------------------------------------------------
+                QUERY PLAN                 
+-------------------------------------------
  Aggregate
-   Output: numeric_scaled_sum_expr((a - b), 4)
+   Output: bounded_numeric_sum((a - b), 4)
    ->  Seq Scan on public.t_ab
          Output: a, b, c
 (4 rows)
 
 EXPLAIN (verbose, costs off) SELECT sum(-a) FROM t_ab;
-                 QUERY PLAN                  
----------------------------------------------
+               QUERY PLAN                
+-----------------------------------------
  Aggregate
-   Output: numeric_scaled_sum_expr((- a), 2)
+   Output: bounded_numeric_sum((- a), 2)
    ->  Seq Scan on public.t_ab
          Output: a, b, c
 (4 rows)
 
 -- nested: (a * b) + a is 22 digits at scale 6, then max(16,8)+1+6 = 23
 EXPLAIN (verbose, costs off) SELECT sum(a * b + a) FROM t_ab;
-                     QUERY PLAN                      
------------------------------------------------------
+                   QUERY PLAN                    
+-------------------------------------------------
  Aggregate
-   Output: numeric_scaled_sum_expr(((a * b) + a), 6)
+   Output: bounded_numeric_sum(((a * b) + a), 6)
    ->  Seq Scan on public.t_ab
          Output: a, b, c
 (4 rows)
 
 -- constants carry no typmod, so their digits are counted from the value
 EXPLAIN (verbose, costs off) SELECT sum(a * 1.2) FROM t_ab;
-                   QUERY PLAN                   
-------------------------------------------------
+                   QUERY PLAN                    
+-------------------------------------------------
  Aggregate
-   Output: numeric_scaled_sum_mul(a, 1.2, 2, 1)
+   Output: bounded_numeric_sum_mul(a, 1.2, 2, 1)
    ->  Seq Scan on public.t_ab
          Output: a, b, c
 (4 rows)
 
 EXPLAIN (verbose, costs off) SELECT sum(a - 1) FROM t_ab;
-                        QUERY PLAN                        
-----------------------------------------------------------
+                      QUERY PLAN                      
+------------------------------------------------------
  Aggregate
-   Output: numeric_scaled_sum_expr((a - '1'::numeric), 2)
+   Output: bounded_numeric_sum((a - '1'::numeric), 2)
    ->  Seq Scan on public.t_ab
          Output: a, b, c
 (4 rows)
 
 EXPLAIN (verbose, costs off) SELECT sum(a * 0.05) FROM t_ab;
-                   QUERY PLAN                    
--------------------------------------------------
+                    QUERY PLAN                    
+--------------------------------------------------
  Aggregate
-   Output: numeric_scaled_sum_mul(a, 0.05, 2, 2)
+   Output: bounded_numeric_sum_mul(a, 0.05, 2, 2)
    ->  Seq Scan on public.t_ab
          Output: a, b, c
 (4 rows)
@@ -275,10 +275,10 @@ EXPLAIN (verbose, costs off) SELECT sum(a * 0.05) FROM t_ab;
 -- A cast inside the product: this is the shape that shows up in reporting
 -- queries, and exprTypmod() does return the typmod of a length coercion.
 EXPLAIN (verbose, costs off) SELECT sum(a * c::numeric(14,4)) FROM t_ab;
-                          QUERY PLAN                           
----------------------------------------------------------------
+                           QUERY PLAN                           
+----------------------------------------------------------------
  Aggregate
-   Output: numeric_scaled_sum_mul(a, (c)::numeric(14,4), 2, 4)
+   Output: bounded_numeric_sum_mul(a, (c)::numeric(14,4), 2, 4)
    ->  Seq Scan on public.t_ab
          Output: a, b, c
 (4 rows)
@@ -286,37 +286,37 @@ EXPLAIN (verbose, costs off) SELECT sum(a * c::numeric(14,4)) FROM t_ab;
 -- round() and trunc() with a constant scale: numeric_round() sets the result's
 -- dscale to exactly max(n,0), and rounding can carry one extra integer digit
 EXPLAIN (verbose, costs off) SELECT sum(round(a * b, 2)) FROM t_ab;
-                       QUERY PLAN                        
----------------------------------------------------------
+                     QUERY PLAN                      
+-----------------------------------------------------
  Aggregate
-   Output: numeric_scaled_sum_expr(round((a * b), 2), 2)
+   Output: bounded_numeric_sum(round((a * b), 2), 2)
    ->  Seq Scan on public.t_ab
          Output: a, b, c
 (4 rows)
 
 EXPLAIN (verbose, costs off) SELECT sum(trunc(a * b, 2)) FROM t_ab;
-                       QUERY PLAN                        
----------------------------------------------------------
+                     QUERY PLAN                      
+-----------------------------------------------------
  Aggregate
-   Output: numeric_scaled_sum_expr(trunc((a * b), 2), 2)
+   Output: bounded_numeric_sum(trunc((a * b), 2), 2)
    ->  Seq Scan on public.t_ab
          Output: a, b, c
 (4 rows)
 
 EXPLAIN (verbose, costs off) SELECT sum(round(a * b)) FROM t_ab;
-                       QUERY PLAN                        
----------------------------------------------------------
+                     QUERY PLAN                      
+-----------------------------------------------------
  Aggregate
-   Output: numeric_scaled_sum_expr(round((a * b), 0), 0)
+   Output: bounded_numeric_sum(round((a * b), 0), 0)
    ->  Seq Scan on public.t_ab
          Output: a, b, c
 (4 rows)
 
 EXPLAIN (verbose, costs off) SELECT sum(round(a, -1)) FROM t_ab;
-                          QUERY PLAN                           
----------------------------------------------------------------
+                        QUERY PLAN                         
+-----------------------------------------------------------
  Aggregate
-   Output: numeric_scaled_sum_expr(round(a, '-1'::integer), 0)
+   Output: bounded_numeric_sum(round(a, '-1'::integer), 0)
    ->  Seq Scan on public.t_ab
          Output: a, b, c
 (4 rows)
@@ -382,46 +382,46 @@ EXPLAIN (verbose, costs off) SELECT sum(a * v) FROM t_ab, t_plain;
 CREATE TABLE t_mul (grp int, a numeric(10,2), b numeric(8,4),
 					d numeric(20,2), e numeric(6,2));
 EXPLAIN (verbose, costs off) SELECT sum(a * b) FROM t_mul;
-                  QUERY PLAN                  
-----------------------------------------------
+                  QUERY PLAN                   
+-----------------------------------------------
  Aggregate
-   Output: numeric_scaled_sum_mul(a, b, 2, 4)
+   Output: bounded_numeric_sum_mul(a, b, 2, 4)
    ->  Seq Scan on public.t_mul
          Output: grp, a, b, d, e
 (4 rows)
 
 EXPLAIN (verbose, costs off) SELECT avg(a * b) FROM t_mul;
-                  QUERY PLAN                  
-----------------------------------------------
+                  QUERY PLAN                   
+-----------------------------------------------
  Aggregate
-   Output: numeric_scaled_avg_mul(a, b, 2, 4)
+   Output: bounded_numeric_avg_mul(a, b, 2, 4)
    ->  Seq Scan on public.t_mul
          Output: grp, a, b, d, e
 (4 rows)
 
 EXPLAIN (verbose, costs off) SELECT sum((a + 1) * b) FROM t_mul;
-                          QUERY PLAN                           
----------------------------------------------------------------
+                           QUERY PLAN                           
+----------------------------------------------------------------
  Aggregate
-   Output: numeric_scaled_sum_mul((a + '1'::numeric), b, 2, 4)
+   Output: bounded_numeric_sum_mul((a + '1'::numeric), b, 2, 4)
    ->  Seq Scan on public.t_mul
          Output: grp, a, b, d, e
 (4 rows)
 
 EXPLAIN (verbose, costs off) SELECT sum(a * 1.2) FROM t_mul;
-                   QUERY PLAN                   
-------------------------------------------------
+                   QUERY PLAN                    
+-------------------------------------------------
  Aggregate
-   Output: numeric_scaled_sum_mul(a, 1.2, 2, 1)
+   Output: bounded_numeric_sum_mul(a, 1.2, 2, 1)
    ->  Seq Scan on public.t_mul
          Output: grp, a, b, d, e
 (4 rows)
 
 EXPLAIN (verbose, costs off) SELECT sum(round(a, 1) * b) FROM t_mul;
-                       QUERY PLAN                       
---------------------------------------------------------
+                       QUERY PLAN                        
+---------------------------------------------------------
  Aggregate
-   Output: numeric_scaled_sum_mul(round(a, 1), b, 1, 4)
+   Output: bounded_numeric_sum_mul(round(a, 1), b, 1, 4)
    ->  Seq Scan on public.t_mul
          Output: grp, a, b, d, e
 (4 rows)
@@ -429,10 +429,10 @@ EXPLAIN (verbose, costs off) SELECT sum(round(a, 1) * b) FROM t_mul;
 -- the product is not at the top: the sum is still specialised, the
 -- multiplication is not
 EXPLAIN (verbose, costs off) SELECT sum(a * b + a) FROM t_mul;
-                     QUERY PLAN                      
------------------------------------------------------
+                   QUERY PLAN                    
+-------------------------------------------------
  Aggregate
-   Output: numeric_scaled_sum_expr(((a * b) + a), 6)
+   Output: bounded_numeric_sum(((a * b) + a), 6)
    ->  Seq Scan on public.t_mul
          Output: grp, a, b, d, e
 (4 rows)
@@ -440,10 +440,10 @@ EXPLAIN (verbose, costs off) SELECT sum(a * b + a) FROM t_mul;
 -- a factor wider than 18 digits cannot go through int128_add_int64_mul_int64,
 -- so this falls back to specialising only the accumulation
 EXPLAIN (verbose, costs off) SELECT sum(d * e) FROM t_mul;
-                  QUERY PLAN                   
------------------------------------------------
+                QUERY PLAN                 
+-------------------------------------------
  Aggregate
-   Output: numeric_scaled_sum_expr((d * e), 4)
+   Output: bounded_numeric_sum((d * e), 4)
    ->  Seq Scan on public.t_mul
          Output: grp, a, b, d, e
 (4 rows)
@@ -452,10 +452,10 @@ EXPLAIN (verbose, costs off) SELECT sum(d * e) FROM t_mul;
 -- left factor and only the outer multiplication is folded away.  The inner one
 -- is still numeric_mul(), which is why 18 + 10 = 28 has to fit.
 EXPLAIN (verbose, costs off) SELECT sum(a * b * a) FROM t_mul;
-                     QUERY PLAN                     
-----------------------------------------------------
+                     QUERY PLAN                      
+-----------------------------------------------------
  Aggregate
-   Output: numeric_scaled_sum_mul((a * b), a, 6, 2)
+   Output: bounded_numeric_sum_mul((a * b), a, 6, 2)
    ->  Seq Scan on public.t_mul
          Output: grp, a, b, d, e
 (4 rows)
@@ -481,7 +481,7 @@ INSERT INTO t_mul VALUES
 	(3,  1.00,  NULL,   1.00, NULL),
 	(4, 'NaN', 1.0000, 'NaN', 1.00),
 	(4,  2.00, 3.0000,  2.00, 3.00);
-SET pg_prosupport.numeric_agg = off;
+SET pg_prosupport.bounded_numeric_agg = off;
 CREATE TABLE t_mulref AS
 	SELECT grp,
 		   sum(a * b)::text          AS s1,
@@ -493,7 +493,7 @@ CREATE TABLE t_mulref AS
 		   sum(d * e)::text          AS s7,
 		   sum(a * b * a)::text      AS s8
 	FROM t_mul GROUP BY grp;
-RESET pg_prosupport.numeric_agg;
+RESET pg_prosupport.bounded_numeric_agg;
 SELECT count(*) AS mul_mismatches
 FROM t_mulref r
 FULL JOIN (
@@ -546,61 +546,61 @@ RESET min_parallel_table_scan_size;
 -- rules of numeric_mul() have to be reproduced exactly all the same, because
 -- no numeric_mul() call happens any more.
 --
-SELECT numeric_scaled_sum_mul(x, y, 2, 2)
+SELECT bounded_numeric_sum_mul(x, y, 2, 2)
   FROM (VALUES ('Infinity'::numeric, 2.00)) t(x, y);
- numeric_scaled_sum_mul 
-------------------------
-               Infinity
+ bounded_numeric_sum_mul 
+-------------------------
+                Infinity
 (1 row)
 
-SELECT numeric_scaled_sum_mul(x, y, 2, 2)
+SELECT bounded_numeric_sum_mul(x, y, 2, 2)
   FROM (VALUES ('Infinity'::numeric, -2.00)) t(x, y);
- numeric_scaled_sum_mul 
-------------------------
-              -Infinity
+ bounded_numeric_sum_mul 
+-------------------------
+               -Infinity
 (1 row)
 
-SELECT numeric_scaled_sum_mul(x, y, 2, 2)
+SELECT bounded_numeric_sum_mul(x, y, 2, 2)
   FROM (VALUES ('Infinity'::numeric, 0.00)) t(x, y);
- numeric_scaled_sum_mul 
-------------------------
-                    NaN
+ bounded_numeric_sum_mul 
+-------------------------
+                     NaN
 (1 row)
 
-SELECT numeric_scaled_sum_mul(x, y, 2, 2)
+SELECT bounded_numeric_sum_mul(x, y, 2, 2)
   FROM (VALUES ('-Infinity'::numeric, '-Infinity'::numeric)) t(x, y);
- numeric_scaled_sum_mul 
-------------------------
-               Infinity
+ bounded_numeric_sum_mul 
+-------------------------
+                Infinity
 (1 row)
 
-SELECT numeric_scaled_sum_mul(x, y, 2, 2)
+SELECT bounded_numeric_sum_mul(x, y, 2, 2)
   FROM (VALUES ('-Infinity'::numeric, 'Infinity'::numeric)) t(x, y);
- numeric_scaled_sum_mul 
-------------------------
-              -Infinity
+ bounded_numeric_sum_mul 
+-------------------------
+               -Infinity
 (1 row)
 
-SELECT numeric_scaled_sum_mul(x, y, 2, 2)
+SELECT bounded_numeric_sum_mul(x, y, 2, 2)
   FROM (VALUES ('NaN'::numeric, 'Infinity'::numeric)) t(x, y);
- numeric_scaled_sum_mul 
-------------------------
-                    NaN
+ bounded_numeric_sum_mul 
+-------------------------
+                     NaN
 (1 row)
 
-SELECT numeric_scaled_sum_mul(x, y, 2, 2)
+SELECT bounded_numeric_sum_mul(x, y, 2, 2)
   FROM (VALUES (NULL::numeric, 2.00)) t(x, y);
- numeric_scaled_sum_mul 
-------------------------
-                       
+ bounded_numeric_sum_mul 
+-------------------------
+                        
 (1 row)
 
 -- a factor that does not honour the scale it was specialised on
-SELECT numeric_scaled_sum_mul(x, y, 2, 2)
+SELECT bounded_numeric_sum_mul(x, y, 2, 2)
   FROM (VALUES (1.234::numeric, 2.00)) t(x, y);
 ERROR:  value does not fit the declared numeric scale
 DETAIL:  The aggregate was specialised on the declared types of the factors; a row source supplied a value outside that declaration.
-SELECT numeric_scaled_sum_mul(x, y, 2, 2)
+SELECT bounded_numeric_sum_mul(x, y, 2, 2)
   FROM (VALUES (1e20::numeric, 2.00)) t(x, y);
 ERROR:  value does not fit the declared numeric scale
 DETAIL:  The aggregate was specialised on the declared types of the factors; a row source supplied a value outside that declaration.
@@ -608,7 +608,7 @@ DETAIL:  The aggregate was specialised on the declared types of the factors; a r
 INSERT INTO t_ab VALUES (1.25, 3.1234, 7.0123456789),
 						(-0.10, 0.0001, -1.0000000001),
 						(99999999.99, 99999999.9999, 1234567890.0123456789);
-SET pg_prosupport.numeric_agg = off;
+SET pg_prosupport.bounded_numeric_agg = off;
 SELECT sum(a * b)::text AS r1, sum(a + b)::text AS r2, sum(a - b)::text AS r3,
 	   sum(-a)::text AS r4, sum(a * b + a)::text AS r5,
 	   sum(a * 1.2)::text AS r6, sum(a - 1)::text AS r7,
@@ -618,7 +618,7 @@ SELECT sum(a * b)::text AS r1, sum(a + b)::text AS r2, sum(a - b)::text AS r3,
 	   sum(trunc(a * b, 2))::text AS r11,
 	   sum(round(a * b))::text AS r12,
 	   sum(round(a, -1))::text AS r13 FROM t_ab \gset
-RESET pg_prosupport.numeric_agg;
+RESET pg_prosupport.bounded_numeric_agg;
 SELECT sum(a * b)::text = :'r1' AS mul,
 	   sum(a + b)::text = :'r2' AS add,
 	   sum(a - b)::text = :'r3' AS sub,
@@ -674,19 +674,19 @@ DROP FUNCTION pps_plpgsql_probe();
 -- final function, exactly as core shares numeric_avg_accum.
 --
 EXPLAIN (verbose, costs off) SELECT avg(v) FROM t_ok;
-             QUERY PLAN             
-------------------------------------
+             QUERY PLAN              
+-------------------------------------
  Aggregate
-   Output: numeric_scaled_avg(v, 2)
+   Output: bounded_numeric_avg(v, 2)
    ->  Seq Scan on public.t_ok
          Output: v
 (4 rows)
 
 EXPLAIN (verbose, costs off) SELECT avg(a * b) FROM t_ab;
-                  QUERY PLAN                  
-----------------------------------------------
+                  QUERY PLAN                   
+-----------------------------------------------
  Aggregate
-   Output: numeric_scaled_avg_mul(a, b, 2, 4)
+   Output: bounded_numeric_avg_mul(a, b, 2, 4)
    ->  Seq Scan on public.t_ab
          Output: a, b, c
 (4 rows)
@@ -735,17 +735,17 @@ EXPLAIN (verbose, costs off) SELECT sum(v) FILTER (WHERE v > 0) FROM t_ok;
 (4 rows)
 
 -- the off switch
-SET pg_prosupport.numeric_agg = off;
+SET pg_prosupport.bounded_numeric_agg = off;
 EXPLAIN (verbose, costs off) SELECT sum(v) FROM t_ok;
-             QUERY PLAN             
-------------------------------------
+          QUERY PLAN           
+-------------------------------
  Aggregate
-   Output: numeric_scaled_sum(v, 2)
+   Output: sum(v)
    ->  Seq Scan on public.t_ok
          Output: v
 (4 rows)
 
-RESET pg_prosupport.numeric_agg;
+RESET pg_prosupport.bounded_numeric_agg;
 --
 -- Values: the substituted aggregate has to match the stock one in everything,
 -- including the result's dscale and the ordering of special values.
@@ -912,32 +912,32 @@ SELECT sum(v) FROM (VALUES ('NaN'::numeric(18,2)), (NULL)) x(v);
 SELECT 'Infinity'::numeric(18,2);
 ERROR:  numeric field overflow
 DETAIL:  A field with precision 18, scale 2 cannot hold an infinite value.
-SELECT numeric_scaled_sum_expr(v, 2)
+SELECT bounded_numeric_sum(v, 2)
   FROM (VALUES ('Infinity'::numeric), (1.00)) x(v);
- numeric_scaled_sum_expr 
--------------------------
-                Infinity
+ bounded_numeric_sum 
+---------------------
+            Infinity
 (1 row)
 
-SELECT numeric_scaled_sum_expr(v, 2)
+SELECT bounded_numeric_sum(v, 2)
   FROM (VALUES ('-Infinity'::numeric), (1.00)) x(v);
- numeric_scaled_sum_expr 
--------------------------
-               -Infinity
+ bounded_numeric_sum 
+---------------------
+           -Infinity
 (1 row)
 
-SELECT numeric_scaled_sum_expr(v, 2)
+SELECT bounded_numeric_sum(v, 2)
   FROM (VALUES ('Infinity'::numeric), ('-Infinity')) x(v);
- numeric_scaled_sum_expr 
--------------------------
-                     NaN
+ bounded_numeric_sum 
+---------------------
+                 NaN
 (1 row)
 
-SELECT numeric_scaled_sum_expr(v, 2)
+SELECT bounded_numeric_sum(v, 2)
   FROM (VALUES ('NaN'::numeric), ('Infinity')) x(v);
- numeric_scaled_sum_expr 
--------------------------
-                     NaN
+ bounded_numeric_sum 
+---------------------
+                 NaN
 (1 row)
 
 --
@@ -953,10 +953,10 @@ INSERT INTO t_bulk
 		 ((i * 7919) % 1000000)::numeric / 10000,
 		 ((i * 104729)::numeric * 1000000007) / 10000000000
   FROM generate_series(1, 20000) i;
-SET pg_prosupport.numeric_agg = off;
+SET pg_prosupport.bounded_numeric_agg = off;
 CREATE TABLE t_ref AS
   SELECT grp, sum(v) AS s, sum(w) AS sw FROM t_bulk GROUP BY grp;
-RESET pg_prosupport.numeric_agg;
+RESET pg_prosupport.bounded_numeric_agg;
 SELECT count(*) AS mismatches
 FROM t_ref r
 FULL JOIN (SELECT grp, sum(v) AS s, sum(w) AS sw FROM t_bulk GROUP BY grp) a
@@ -969,9 +969,9 @@ WHERE r.s::text IS DISTINCT FROM a.s::text
 (1 row)
 
 -- and the same for the sum over the whole table
-SET pg_prosupport.numeric_agg = off;
+SET pg_prosupport.bounded_numeric_agg = off;
 SELECT sum(v)::text AS ref FROM t_bulk \gset
-RESET pg_prosupport.numeric_agg;
+RESET pg_prosupport.bounded_numeric_agg;
 SELECT sum(v)::text = :'ref' AS matches_stock FROM t_bulk;
  matches_stock 
 ---------------
@@ -980,11 +980,11 @@ SELECT sum(v)::text = :'ref' AS matches_stock FROM t_bulk;
 
 -- avg() over the same data, grouped and ungrouped: the quotient's scale comes
 -- out of select_div_scale(), so a dscale mismatch in our sum would show here
-SET pg_prosupport.numeric_agg = off;
+SET pg_prosupport.bounded_numeric_agg = off;
 CREATE TABLE t_avgref AS
   SELECT grp, avg(v) AS a, avg(w) AS aw FROM t_bulk GROUP BY grp;
 SELECT avg(v)::text AS avgref FROM t_bulk \gset
-RESET pg_prosupport.numeric_agg;
+RESET pg_prosupport.bounded_numeric_agg;
 SELECT count(*) AS avg_mismatches
 FROM t_avgref r
 FULL JOIN (SELECT grp, avg(v) AS a, avg(w) AS aw FROM t_bulk GROUP BY grp) x
@@ -1057,9 +1057,9 @@ INSERT INTO t_big
               ELSE 9999999999999999.99 END
   FROM generate_series(1, 100000) i;
 ANALYZE t_big;
-SET pg_prosupport.numeric_agg = off;
+SET pg_prosupport.bounded_numeric_agg = off;
 SELECT sum(v)::text AS bigref FROM t_big \gset
-RESET pg_prosupport.numeric_agg;
+RESET pg_prosupport.bounded_numeric_agg;
 SELECT sum(v)::text = :'bigref' AS big_parallel_matches_stock FROM t_big;
  big_parallel_matches_stock 
 ----------------------------
@@ -1081,9 +1081,9 @@ INSERT INTO t_bigw
 			  ELSE 9876543210987654.3210987654 END
   FROM generate_series(1, 100000) i;
 ANALYZE t_bigw;
-SET pg_prosupport.numeric_agg = off;
+SET pg_prosupport.bounded_numeric_agg = off;
 SELECT sum(v)::text AS bigwref FROM t_bigw \gset
-RESET pg_prosupport.numeric_agg;
+RESET pg_prosupport.bounded_numeric_agg;
 SELECT sum(v)::text = :'bigwref' AS wide_parallel_matches_stock FROM t_bigw;
  wide_parallel_matches_stock 
 -----------------------------
@@ -1105,13 +1105,13 @@ RESET min_parallel_table_scan_size;
 -- A broken contract.  Calling the aggregate directly with a scale the value
 -- does not conform to has to raise an error rather than round quietly.
 --
-SELECT numeric_scaled_sum_expr(v, 2) FROM (VALUES (1.234::numeric)) x(v);
+SELECT bounded_numeric_sum(v, 2) FROM (VALUES (1.234::numeric)) x(v);
 ERROR:  value does not fit the declared numeric scale 2
 DETAIL:  The aggregate was specialised on the argument's declared type; a row source supplied a value outside that declaration.
-SELECT numeric_scaled_sum_expr(v, 2) FROM (VALUES (1e26::numeric)) x(v);
+SELECT bounded_numeric_sum(v, 2) FROM (VALUES (1e26::numeric)) x(v);
 ERROR:  value does not fit the declared numeric scale 2
 DETAIL:  The aggregate was specialised on the argument's declared type; a row source supplied a value outside that declaration.
-SELECT numeric_scaled_sum_expr(v, 2) FROM (VALUES (1e30::numeric)) x(v);
+SELECT bounded_numeric_sum(v, 2) FROM (VALUES (1e30::numeric)) x(v);
 ERROR:  value does not fit the declared numeric scale 2
 DETAIL:  The aggregate was specialised on the argument's declared type; a row source supplied a value outside that declaration.
 --
@@ -1120,24 +1120,23 @@ DETAIL:  The aggregate was specialised on the argument's declared type; a row so
 -- connection pool, where a generic plan can live for hours, those are exactly
 -- the sessions the switch was added for.
 --
--- avg(numeric), not sum(numeric): sum(v) over a plain numeric(p,s) column is
--- substituted by core's own simplify_sum_numeric_aggref() now (see
--- patches/pg18-numeric-scaled-sum-catalog.patch), unconditionally and with no
--- GUC of its own, so it would no longer show the switch doing anything.
--- avg(numeric) is still entirely this extension's rewrite.
+-- avg(numeric) here, though sum(v) over a plain numeric(p,s) column would
+-- show exactly the same thing: both are this extension's own rewrite,
+-- reached through the same hook and governed by the same GUC, with no
+-- core-level substitution running ahead of either one.
 --
 SET plan_cache_mode = force_generic_plan;
 PREPARE pavg AS SELECT avg(v) FROM t_ok;
 EXPLAIN (verbose, costs off) EXECUTE pavg;
-             QUERY PLAN             
-------------------------------------
+             QUERY PLAN              
+-------------------------------------
  Aggregate
-   Output: numeric_scaled_avg(v, 2)
+   Output: bounded_numeric_avg(v, 2)
    ->  Seq Scan on public.t_ok
          Output: v
 (4 rows)
 
-SET pg_prosupport.numeric_agg = off;
+SET pg_prosupport.bounded_numeric_agg = off;
 EXPLAIN (verbose, costs off) EXECUTE pavg;
           QUERY PLAN           
 -------------------------------
@@ -1147,12 +1146,12 @@ EXPLAIN (verbose, costs off) EXECUTE pavg;
          Output: v
 (4 rows)
 
-RESET pg_prosupport.numeric_agg;
+RESET pg_prosupport.bounded_numeric_agg;
 EXPLAIN (verbose, costs off) EXECUTE pavg;
-             QUERY PLAN             
-------------------------------------
+             QUERY PLAN              
+-------------------------------------
  Aggregate
-   Output: numeric_scaled_avg(v, 2)
+   Output: bounded_numeric_avg(v, 2)
    ->  Seq Scan on public.t_ok
          Output: v
 (4 rows)
@@ -1189,12 +1188,12 @@ SELECT max(v) FROM t_ok;
 -- do, so there is nothing for a switch to decide).  avg(v) is still ours to
 -- turn off.
 --
-SET pg_prosupport.numeric_agg = off;
+SET pg_prosupport.bounded_numeric_agg = off;
 EXPLAIN (verbose, costs off) SELECT sum(v) FROM t_ok;
-             QUERY PLAN             
-------------------------------------
+          QUERY PLAN           
+-------------------------------
  Aggregate
-   Output: numeric_scaled_sum(v, 2)
+   Output: sum(v)
    ->  Seq Scan on public.t_ok
          Output: v
 (4 rows)
@@ -1208,7 +1207,7 @@ EXPLAIN (verbose, costs off) SELECT avg(v) FROM t_ok;
          Output: v
 (4 rows)
 
-RESET pg_prosupport.numeric_agg;
+RESET pg_prosupport.bounded_numeric_agg;
 DROP TABLE t_ok, t_wide, t_w28, t_w29, t_plain, t_int0, t_frac, t_dom, t_dom2,
 		   t_bulk, t_ref, t_big, t_bigw, t_ab, t_avgref, t_mul, t_mulref;
 DROP DOMAIN money18_2;

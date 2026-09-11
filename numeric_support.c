@@ -4,13 +4,13 @@
  *	  Plan-time substitution of specialised aggregates for sum(numeric) and
  *	  avg(numeric).
  *
- * pg_prosupport.c's pps_agg_simplify_hook() calls pps_simplify_scaled_numeric_agg()
+ * pg_prosupport.c's pps_agg_simplify_hook() calls pps_simplify_bounded_numeric_agg()
  * below once for every Aggref in every query, one of a fixed sequence of
  * independent rewrites (see that function's own comment); it is this
  * function's job to recognise sum(numeric)/avg(numeric) by aggfnoid and, if
  * the input can be shown to be narrow enough, return a new Aggref carrying a
  * different aggfnoid.  Anything else is declined immediately.  This module
- * owns one GUC, pg_prosupport.numeric_agg (on by default), that gates this
+ * owns one GUC, pg_prosupport.bounded_numeric_agg (on by default), that gates this
  * rewrite alone -- constagg.c's constant fold is a separate rewrite behind a
  * separate switch, no longer reached from here.
  *
@@ -63,15 +63,14 @@
 #endif
 
 /*
- * The off switch for this rewrite alone (GUC pg_prosupport.numeric_agg,
+ * The off switch for this rewrite alone (GUC pg_prosupport.bounded_numeric_agg,
  * defined in pg_prosupport.c's _PG_init() so that both this and
  * constagg.c's pps_fold_const_sum flush the plan cache on the same terms).
  * On by default: narrowing an accumulator is never a change of plan shape a
- * DBA needs to opt into, only ever a change of which numeric_scaled_*
- * function runs the accumulation, and this extends the same idea patch 2
- * already applies to plain sum(column) in core without a switch at all.
+ * DBA needs to opt into, only ever a change of which bounded_numeric_*
+ * function runs the accumulation.
  */
-bool		pps_numeric_agg = true;
+bool		pps_bounded_numeric_agg = true;
 
 /* the mantissa fits in int128 and the accumulator holds ~1.7e10 addends */
 #define PPS_MAX_PRECISION	28
@@ -79,7 +78,7 @@ bool		pps_numeric_agg = true;
 /*
  * The highest precision a factor of a folded product may have.  Both mantissas
  * have to fit an int64, because that is what int128_add_int64_mul_int64()
- * takes; see pps_scaled_accum_mul().
+ * takes; see pps_bounded_accum_mul().
  */
 #define PPS_MAX_FACTOR_PRECISION	18
 
@@ -90,10 +89,10 @@ bool		pps_numeric_agg = true;
  */
 static Oid	pps_sum_numeric_oid = InvalidOid;
 static Oid	pps_avg_numeric_oid = InvalidOid;
-static Oid	pps_scaled_sum_expr_oid = InvalidOid;
-static Oid	pps_scaled_avg_oid = InvalidOid;
-static Oid	pps_scaled_sum_mul_oid = InvalidOid;
-static Oid	pps_scaled_avg_mul_oid = InvalidOid;
+static Oid	pps_bounded_sum_oid = InvalidOid;
+static Oid	pps_bounded_avg_oid = InvalidOid;
+static Oid	pps_bounded_sum_mul_oid = InvalidOid;
+static Oid	pps_bounded_avg_mul_oid = InvalidOid;
 static bool pps_cache_valid = false;
 static bool pps_oids_ok = false;
 
@@ -150,7 +149,7 @@ pps_load_oids(void)
 	Oid			extoid;
 	Oid			nsp;
 	Oid			builtin_args[1] = {NUMERICOID};
-	Oid			scaled_args[2] = {NUMERICOID, INT4OID};
+	Oid			bounded_args[2] = {NUMERICOID, INT4OID};
 	Oid			mul_args[4] = {NUMERICOID, NUMERICOID, INT4OID, INT4OID};
 
 	if (pps_cache_valid)
@@ -171,35 +170,35 @@ pps_load_oids(void)
 	{
 		char	   *nspname = get_namespace_name(nsp);
 
-		pps_scaled_sum_expr_oid =
+		pps_bounded_sum_oid =
 			LookupFuncName(list_make2(makeString(nspname),
-									  makeString("numeric_scaled_sum_expr")),
-						   2, scaled_args, true);
-		pps_scaled_avg_oid =
+									  makeString("bounded_numeric_sum")),
+						   2, bounded_args, true);
+		pps_bounded_avg_oid =
 			LookupFuncName(list_make2(makeString(nspname),
-									  makeString("numeric_scaled_avg")),
-						   2, scaled_args, true);
-		pps_scaled_sum_mul_oid =
+									  makeString("bounded_numeric_avg")),
+						   2, bounded_args, true);
+		pps_bounded_sum_mul_oid =
 			LookupFuncName(list_make2(makeString(nspname),
-									  makeString("numeric_scaled_sum_mul")),
+									  makeString("bounded_numeric_sum_mul")),
 						   4, mul_args, true);
-		pps_scaled_avg_mul_oid =
+		pps_bounded_avg_mul_oid =
 			LookupFuncName(list_make2(makeString(nspname),
-									  makeString("numeric_scaled_avg_mul")),
+									  makeString("bounded_numeric_avg_mul")),
 						   4, mul_args, true);
 	}
 	else
 	{
-		pps_scaled_sum_expr_oid = InvalidOid;
-		pps_scaled_avg_oid = InvalidOid;
-		pps_scaled_sum_mul_oid = InvalidOid;
-		pps_scaled_avg_mul_oid = InvalidOid;
+		pps_bounded_sum_oid = InvalidOid;
+		pps_bounded_avg_oid = InvalidOid;
+		pps_bounded_sum_mul_oid = InvalidOid;
+		pps_bounded_avg_mul_oid = InvalidOid;
 	}
 
-	pps_oids_ok = OidIsValid(pps_scaled_sum_expr_oid) &&
-		OidIsValid(pps_scaled_avg_oid) &&
-		OidIsValid(pps_scaled_sum_mul_oid) &&
-		OidIsValid(pps_scaled_avg_mul_oid);
+	pps_oids_ok = OidIsValid(pps_bounded_sum_oid) &&
+		OidIsValid(pps_bounded_avg_oid) &&
+		OidIsValid(pps_bounded_sum_mul_oid) &&
+		OidIsValid(pps_bounded_avg_mul_oid);
 	pps_cache_valid = true;
 
 	if (!pps_oids_ok)
@@ -585,7 +584,7 @@ pps_scale_const(int value, AttrNumber resno)
 }
 
 /*
- * pps_simplify_scaled_numeric_agg
+ * pps_simplify_bounded_numeric_agg
  *		The scale-specialisation rewrite alone: sum(numeric)/avg(numeric)
  *		narrowed to a bounded accumulator, including the product fold.
  *		Called once for every Aggref the planner meets (see
@@ -607,7 +606,7 @@ pps_scale_const(int value, AttrNumber resno)
  * belongs to, beyond the plain agglevelsup test below) would want it.
  */
 Node *
-pps_simplify_scaled_numeric_agg(struct PlannerInfo *root, Aggref *agg)
+pps_simplify_bounded_numeric_agg(struct PlannerInfo *root, Aggref *agg)
 {
 	TargetEntry *tle;
 	Node	   *lhs;
@@ -618,7 +617,7 @@ pps_simplify_scaled_numeric_agg(struct PlannerInfo *root, Aggref *agg)
 				s2;
 	Oid			newfn;
 	Aggref	   *newagg;
-	bool		scaled_ok;
+	bool		bounded_ok;
 
 	/*
 	 * pps_load_oids() prints its own reason when the specialised aggregates
@@ -631,7 +630,7 @@ pps_simplify_scaled_numeric_agg(struct PlannerInfo *root, Aggref *agg)
 	 * agg->aggfnoid against otherwise.  The lookups are cached, so on every
 	 * call after the first in a backend this is two flag checks.
 	 */
-	scaled_ok = pps_load_oids();
+	bounded_ok = pps_load_oids();
 
 	/*
 	 * Is this even one of ours?  Every Aggref in every query reaches this
@@ -640,20 +639,18 @@ pps_simplify_scaled_numeric_agg(struct PlannerInfo *root, Aggref *agg)
 	 * count(*) or a max(text) here is the overwhelmingly common case, not a
 	 * misconfiguration, so there is nothing to log about it.
 	 *
-	 * Note that agg_simplify_hook only runs when core's own direct call
-	 * (simplify_sum_numeric_aggref(), for sum(numeric) alone) has already
-	 * declined -- see clauses.c.  So an aggfnoid still equal to
-	 * pps_sum_numeric_oid here means one of: DISTINCT/ORDER BY/FILTER/
-	 * VARIADIC/an outer reference, or an argument whose precision and scale
-	 * are not a plain typmod core can read off directly -- typically an
-	 * arithmetic expression, which is exactly what pps_derive_bounds() below
-	 * is for.  A plain sum(c) with c declared numeric(p,s) never reaches this
-	 * function at all any more.
+	 * There is no core-level substitution running ahead of this one -- on a
+	 * server built with only the agg_simplify_hook patch (the pre-PG19
+	 * target this extension is for), a plain sum(c) with c declared
+	 * numeric(p,s) reaches this function exactly the same way sum(a + b) or
+	 * avg(c) does, and pps_derive_bounds() below proves the plain-typmod
+	 * case (its first branch) the same way it proves an arithmetic
+	 * expression's.
 	 */
 	if (agg->aggfnoid == pps_sum_numeric_oid)
-		newfn = pps_scaled_sum_expr_oid;
+		newfn = pps_bounded_sum_oid;
 	else if (agg->aggfnoid == pps_avg_numeric_oid)
-		newfn = pps_scaled_avg_oid;
+		newfn = pps_bounded_avg_oid;
 	else
 		return NULL;
 
@@ -662,14 +659,14 @@ pps_simplify_scaled_numeric_agg(struct PlannerInfo *root, Aggref *agg)
 	 * already had its own turn by the time pps_agg_simplify_hook() calls this
 	 * function; see its comment.
 	 */
-	if (!pps_numeric_agg)
+	if (!pps_bounded_numeric_agg)
 	{
-		pps_decline(agg->aggfnoid, "pg_prosupport.numeric_agg is off");
+		pps_decline(agg->aggfnoid, "pg_prosupport.bounded_numeric_agg is off");
 		return NULL;
 	}
 
 	/* everything below replaces the aggregate with one of ours */
-	if (!scaled_ok)
+	if (!bounded_ok)
 		return NULL;
 
 	/*
@@ -712,8 +709,8 @@ pps_simplify_scaled_numeric_agg(struct PlannerInfo *root, Aggref *agg)
 	 */
 	if (pps_split_product((Node *) tle->expr, &lhs, &rhs, &s1, &s2))
 	{
-		newfn = (newfn == pps_scaled_sum_expr_oid) ? pps_scaled_sum_mul_oid
-			: pps_scaled_avg_mul_oid;
+		newfn = (newfn == pps_bounded_sum_oid) ? pps_bounded_sum_mul_oid
+			: pps_bounded_avg_mul_oid;
 
 		newagg = copyObject(agg);
 		newagg->aggfnoid = newfn;

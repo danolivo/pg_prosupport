@@ -25,7 +25,7 @@ extern void pps_decline(Oid aggfnoid, const char *reason);
 /*
  * numeric_support.c
  *
- * pps_numeric_agg is this rewrite's own switch (GUC pg_prosupport.numeric_agg,
+ * pps_bounded_numeric_agg is this rewrite's own switch (GUC pg_prosupport.bounded_numeric_agg,
  * default on): the specialised sum()/avg() over a bounded numeric, including
  * the product fold.  pps_get_sum_numeric_oid() is the one piece of plumbing
  * this module shares with constagg.c -- which aggregate is pg_catalog.
@@ -33,9 +33,9 @@ extern void pps_decline(Oid aggfnoid, const char *reason);
  * independently invalidated cache of the same fact just to recognise its own
  * Aggref.
  */
-extern bool pps_numeric_agg;
+extern bool pps_bounded_numeric_agg;
 extern void pps_syscache_reset(Datum arg, int cacheid, uint32 hashvalue);
-extern Node *pps_simplify_scaled_numeric_agg(struct PlannerInfo *root, Aggref *agg);
+extern Node *pps_simplify_bounded_numeric_agg(struct PlannerInfo *root, Aggref *agg);
 extern Oid	pps_get_sum_numeric_oid(void);
 
 /*
@@ -44,7 +44,7 @@ extern Oid	pps_get_sum_numeric_oid(void);
  * pps_fold_const_sum is this rewrite's own switch (GUC
  * pg_prosupport.fold_const_sum, default off -- see the comment above the
  * DefineCustomBoolVariable() call in pg_prosupport.c for why the default
- * differs from pps_numeric_agg's).
+ * differs from pps_bounded_numeric_agg's).
  */
 extern bool pps_fold_const_sum;
 extern Node *pps_simplify_const_sum(Aggref *agg);

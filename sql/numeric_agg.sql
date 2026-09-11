@@ -145,7 +145,7 @@ INSERT INTO t_mul VALUES
 	(4, 'NaN', 1.0000, 'NaN', 1.00),
 	(4,  2.00, 3.0000,  2.00, 3.00);
 
-SET pg_prosupport.numeric_agg = off;
+SET pg_prosupport.bounded_numeric_agg = off;
 CREATE TABLE t_mulref AS
 	SELECT grp,
 		   sum(a * b)::text          AS s1,
@@ -157,7 +157,7 @@ CREATE TABLE t_mulref AS
 		   sum(d * e)::text          AS s7,
 		   sum(a * b * a)::text      AS s8
 	FROM t_mul GROUP BY grp;
-RESET pg_prosupport.numeric_agg;
+RESET pg_prosupport.bounded_numeric_agg;
 
 SELECT count(*) AS mul_mismatches
 FROM t_mulref r
@@ -196,24 +196,24 @@ RESET min_parallel_table_scan_size;
 -- rules of numeric_mul() have to be reproduced exactly all the same, because
 -- no numeric_mul() call happens any more.
 --
-SELECT numeric_scaled_sum_mul(x, y, 2, 2)
+SELECT bounded_numeric_sum_mul(x, y, 2, 2)
   FROM (VALUES ('Infinity'::numeric, 2.00)) t(x, y);
-SELECT numeric_scaled_sum_mul(x, y, 2, 2)
+SELECT bounded_numeric_sum_mul(x, y, 2, 2)
   FROM (VALUES ('Infinity'::numeric, -2.00)) t(x, y);
-SELECT numeric_scaled_sum_mul(x, y, 2, 2)
+SELECT bounded_numeric_sum_mul(x, y, 2, 2)
   FROM (VALUES ('Infinity'::numeric, 0.00)) t(x, y);
-SELECT numeric_scaled_sum_mul(x, y, 2, 2)
+SELECT bounded_numeric_sum_mul(x, y, 2, 2)
   FROM (VALUES ('-Infinity'::numeric, '-Infinity'::numeric)) t(x, y);
-SELECT numeric_scaled_sum_mul(x, y, 2, 2)
+SELECT bounded_numeric_sum_mul(x, y, 2, 2)
   FROM (VALUES ('-Infinity'::numeric, 'Infinity'::numeric)) t(x, y);
-SELECT numeric_scaled_sum_mul(x, y, 2, 2)
+SELECT bounded_numeric_sum_mul(x, y, 2, 2)
   FROM (VALUES ('NaN'::numeric, 'Infinity'::numeric)) t(x, y);
-SELECT numeric_scaled_sum_mul(x, y, 2, 2)
+SELECT bounded_numeric_sum_mul(x, y, 2, 2)
   FROM (VALUES (NULL::numeric, 2.00)) t(x, y);
 -- a factor that does not honour the scale it was specialised on
-SELECT numeric_scaled_sum_mul(x, y, 2, 2)
+SELECT bounded_numeric_sum_mul(x, y, 2, 2)
   FROM (VALUES (1.234::numeric, 2.00)) t(x, y);
-SELECT numeric_scaled_sum_mul(x, y, 2, 2)
+SELECT bounded_numeric_sum_mul(x, y, 2, 2)
   FROM (VALUES (1e20::numeric, 2.00)) t(x, y);
 
 -- and the values have to match core exactly, dscale included
@@ -221,7 +221,7 @@ INSERT INTO t_ab VALUES (1.25, 3.1234, 7.0123456789),
 						(-0.10, 0.0001, -1.0000000001),
 						(99999999.99, 99999999.9999, 1234567890.0123456789);
 
-SET pg_prosupport.numeric_agg = off;
+SET pg_prosupport.bounded_numeric_agg = off;
 SELECT sum(a * b)::text AS r1, sum(a + b)::text AS r2, sum(a - b)::text AS r3,
 	   sum(-a)::text AS r4, sum(a * b + a)::text AS r5,
 	   sum(a * 1.2)::text AS r6, sum(a - 1)::text AS r7,
@@ -231,7 +231,7 @@ SELECT sum(a * b)::text AS r1, sum(a + b)::text AS r2, sum(a - b)::text AS r3,
 	   sum(trunc(a * b, 2))::text AS r11,
 	   sum(round(a * b))::text AS r12,
 	   sum(round(a, -1))::text AS r13 FROM t_ab \gset
-RESET pg_prosupport.numeric_agg;
+RESET pg_prosupport.bounded_numeric_agg;
 
 SELECT sum(a * b)::text = :'r1' AS mul,
 	   sum(a + b)::text = :'r2' AS add,
@@ -280,9 +280,9 @@ EXPLAIN (verbose, costs off) SELECT sum(DISTINCT v) FROM t_ok;
 EXPLAIN (verbose, costs off) SELECT sum(v ORDER BY v) FROM t_ok;
 EXPLAIN (verbose, costs off) SELECT sum(v) FILTER (WHERE v > 0) FROM t_ok;
 -- the off switch
-SET pg_prosupport.numeric_agg = off;
+SET pg_prosupport.bounded_numeric_agg = off;
 EXPLAIN (verbose, costs off) SELECT sum(v) FROM t_ok;
-RESET pg_prosupport.numeric_agg;
+RESET pg_prosupport.bounded_numeric_agg;
 
 --
 -- Values: the substituted aggregate has to match the stock one in everything,
@@ -340,13 +340,13 @@ SELECT sum(v) FROM (VALUES ('NaN'::numeric(18,2)), (1.00)) x(v);
 SELECT sum(v) FROM (VALUES ('NaN'::numeric(18,2)), (NULL)) x(v);
 SELECT 'Infinity'::numeric(18,2);
 
-SELECT numeric_scaled_sum_expr(v, 2)
+SELECT bounded_numeric_sum(v, 2)
   FROM (VALUES ('Infinity'::numeric), (1.00)) x(v);
-SELECT numeric_scaled_sum_expr(v, 2)
+SELECT bounded_numeric_sum(v, 2)
   FROM (VALUES ('-Infinity'::numeric), (1.00)) x(v);
-SELECT numeric_scaled_sum_expr(v, 2)
+SELECT bounded_numeric_sum(v, 2)
   FROM (VALUES ('Infinity'::numeric), ('-Infinity')) x(v);
-SELECT numeric_scaled_sum_expr(v, 2)
+SELECT bounded_numeric_sum(v, 2)
   FROM (VALUES ('NaN'::numeric), ('Infinity')) x(v);
 
 --
@@ -363,10 +363,10 @@ INSERT INTO t_bulk
 		 ((i * 104729)::numeric * 1000000007) / 10000000000
   FROM generate_series(1, 20000) i;
 
-SET pg_prosupport.numeric_agg = off;
+SET pg_prosupport.bounded_numeric_agg = off;
 CREATE TABLE t_ref AS
   SELECT grp, sum(v) AS s, sum(w) AS sw FROM t_bulk GROUP BY grp;
-RESET pg_prosupport.numeric_agg;
+RESET pg_prosupport.bounded_numeric_agg;
 
 SELECT count(*) AS mismatches
 FROM t_ref r
@@ -376,18 +376,18 @@ WHERE r.s::text IS DISTINCT FROM a.s::text
    OR r.sw::text IS DISTINCT FROM a.sw::text;
 
 -- and the same for the sum over the whole table
-SET pg_prosupport.numeric_agg = off;
+SET pg_prosupport.bounded_numeric_agg = off;
 SELECT sum(v)::text AS ref FROM t_bulk \gset
-RESET pg_prosupport.numeric_agg;
+RESET pg_prosupport.bounded_numeric_agg;
 SELECT sum(v)::text = :'ref' AS matches_stock FROM t_bulk;
 
 -- avg() over the same data, grouped and ungrouped: the quotient's scale comes
 -- out of select_div_scale(), so a dscale mismatch in our sum would show here
-SET pg_prosupport.numeric_agg = off;
+SET pg_prosupport.bounded_numeric_agg = off;
 CREATE TABLE t_avgref AS
   SELECT grp, avg(v) AS a, avg(w) AS aw FROM t_bulk GROUP BY grp;
 SELECT avg(v)::text AS avgref FROM t_bulk \gset
-RESET pg_prosupport.numeric_agg;
+RESET pg_prosupport.bounded_numeric_agg;
 
 SELECT count(*) AS avg_mismatches
 FROM t_avgref r
@@ -431,9 +431,9 @@ INSERT INTO t_big
   FROM generate_series(1, 100000) i;
 ANALYZE t_big;
 
-SET pg_prosupport.numeric_agg = off;
+SET pg_prosupport.bounded_numeric_agg = off;
 SELECT sum(v)::text AS bigref FROM t_big \gset
-RESET pg_prosupport.numeric_agg;
+RESET pg_prosupport.bounded_numeric_agg;
 
 SELECT sum(v)::text = :'bigref' AS big_parallel_matches_stock FROM t_big;
 SET max_parallel_workers_per_gather = 0;
@@ -448,9 +448,9 @@ INSERT INTO t_bigw
   FROM generate_series(1, 100000) i;
 ANALYZE t_bigw;
 
-SET pg_prosupport.numeric_agg = off;
+SET pg_prosupport.bounded_numeric_agg = off;
 SELECT sum(v)::text AS bigwref FROM t_bigw \gset
-RESET pg_prosupport.numeric_agg;
+RESET pg_prosupport.bounded_numeric_agg;
 
 SELECT sum(v)::text = :'bigwref' AS wide_parallel_matches_stock FROM t_bigw;
 SET max_parallel_workers_per_gather = 0;
@@ -465,9 +465,9 @@ RESET min_parallel_table_scan_size;
 -- A broken contract.  Calling the aggregate directly with a scale the value
 -- does not conform to has to raise an error rather than round quietly.
 --
-SELECT numeric_scaled_sum_expr(v, 2) FROM (VALUES (1.234::numeric)) x(v);
-SELECT numeric_scaled_sum_expr(v, 2) FROM (VALUES (1e26::numeric)) x(v);
-SELECT numeric_scaled_sum_expr(v, 2) FROM (VALUES (1e30::numeric)) x(v);
+SELECT bounded_numeric_sum(v, 2) FROM (VALUES (1.234::numeric)) x(v);
+SELECT bounded_numeric_sum(v, 2) FROM (VALUES (1e26::numeric)) x(v);
+SELECT bounded_numeric_sum(v, 2) FROM (VALUES (1e30::numeric)) x(v);
 
 --
 -- The off switch has to reach a saved generic plan.  A GUC is not a source of
@@ -475,18 +475,17 @@ SELECT numeric_scaled_sum_expr(v, 2) FROM (VALUES (1e30::numeric)) x(v);
 -- connection pool, where a generic plan can live for hours, those are exactly
 -- the sessions the switch was added for.
 --
--- avg(numeric), not sum(numeric): sum(v) over a plain numeric(p,s) column is
--- substituted by core's own simplify_sum_numeric_aggref() now (see
--- patches/pg18-numeric-scaled-sum-catalog.patch), unconditionally and with no
--- GUC of its own, so it would no longer show the switch doing anything.
--- avg(numeric) is still entirely this extension's rewrite.
+-- avg(numeric) here, though sum(v) over a plain numeric(p,s) column would
+-- show exactly the same thing: both are this extension's own rewrite,
+-- reached through the same hook and governed by the same GUC, with no
+-- core-level substitution running ahead of either one.
 --
 SET plan_cache_mode = force_generic_plan;
 PREPARE pavg AS SELECT avg(v) FROM t_ok;
 EXPLAIN (verbose, costs off) EXECUTE pavg;
-SET pg_prosupport.numeric_agg = off;
+SET pg_prosupport.bounded_numeric_agg = off;
 EXPLAIN (verbose, costs off) EXECUTE pavg;
-RESET pg_prosupport.numeric_agg;
+RESET pg_prosupport.bounded_numeric_agg;
 EXPLAIN (verbose, costs off) EXECUTE pavg;
 
 DEALLOCATE pavg;
@@ -510,10 +509,10 @@ SELECT max(v) FROM t_ok;
 -- do, so there is nothing for a switch to decide).  avg(v) is still ours to
 -- turn off.
 --
-SET pg_prosupport.numeric_agg = off;
+SET pg_prosupport.bounded_numeric_agg = off;
 EXPLAIN (verbose, costs off) SELECT sum(v) FROM t_ok;
 EXPLAIN (verbose, costs off) SELECT avg(v) FROM t_ok;
-RESET pg_prosupport.numeric_agg;
+RESET pg_prosupport.bounded_numeric_agg;
 
 DROP TABLE t_ok, t_wide, t_w28, t_w29, t_plain, t_int0, t_frac, t_dom, t_dom2,
 		   t_bulk, t_ref, t_big, t_bigw, t_ab, t_avgref, t_mul, t_mulref;

@@ -5,8 +5,8 @@
  *
  * The support function in numeric_support.c proves that the argument's
  * precision and scale satisfy 1 <= p <= 28 and 0 <= s <= p, and rewrites the
- * Aggref to call numeric_scaled_sum(numeric, int4) or
- * numeric_scaled_avg(numeric, int4) with s supplied as a constant.  Both share
+ * Aggref to call bounded_numeric_sum(numeric, int4) or
+ * bounded_numeric_avg(numeric, int4) with s supplied as a constant.  Both share
  * everything but the final function, just as core shares numeric_avg_accum
  * between sum() and avg().
  *
@@ -208,7 +208,7 @@ static const int32 pow10_int32[DEC_DIGITS] = {1, 10, 100, 1000};
  * The caller must guarantee *i128 >= 0, 0 < mul <= NBASE and 0 <= add < NBASE;
  * under those conditions no intermediate value overflows.  There is no check
  * on the 128-bit result itself -- the digit-count bound in
- * pps_get_scaled_int128() takes its place.
+ * pps_get_bounded_int128() takes its place.
  *
  * common/int128.h has no such helper because numeric.c gets by with addition
  * and the product of two int64s.  What we need is a Horner loop over the
@@ -264,7 +264,7 @@ pps_int128_neg(INT128 *i128)
  *		The high and low 64-bit halves of an INT128, in the same layout
  *		common/int128.h uses for its emulated struct.  Neither accessor is
  *		exposed by that header -- it only ever hands out whole INT128
- *		values -- but pps_scaled_serialize()/pps_scaled_deserialize() have to
+ *		values -- but pps_bounded_serialize()/pps_bounded_deserialize() have to
  *		ship the two halves separately down the wire, and
  *		pps_int128_fits_int64() below has to look at them individually to
  *		test for sign extension.
@@ -292,7 +292,7 @@ PG_INT128_LO_UINT64(INT128 v)
 /*
  * make_int128
  *		The inverse of the two accessors above: rebuild an INT128 from its
- *		halves, the way pps_scaled_deserialize() needs after reading them
+ *		halves, the way pps_bounded_deserialize() needs after reading them
  *		back separately.
  */
 static inline INT128
@@ -315,7 +315,7 @@ make_int128(int64 hi, uint64 lo)
  *
  * common/int128.h has no such helper: every core caller only ever adds a
  * bare int64 or an int64*int64 product into an accumulator.
- * pps_scaled_accum() and pps_scaled_combine() are the exception, merging one
+ * pps_bounded_accum() and pps_bounded_combine() are the exception, merging one
  * full 128-bit accumulator into another, so it is provided here in the same
  * style as pps_int128_mul_add() and pps_int128_neg() above.
  */
@@ -445,7 +445,7 @@ pps_decimal_len(NumericDigit d)
 }
 
 /*
- * pps_get_scaled_int128
+ * pps_get_bounded_int128
  *		The value's mantissa at scale target_scale.
  *
  * Returns false when the value does not fit -- that is, when the promise made
@@ -481,7 +481,7 @@ pps_decimal_len(NumericDigit d)
  * a single digit with stored = 0.
  */
 static bool
-pps_get_scaled_int128(union NumericChoice *c, int datalen, int target_scale,
+pps_get_bounded_int128(union NumericChoice *c, int datalen, int target_scale,
 					  INT128 *out)
 {
 	NumericDigit *digits;
@@ -575,13 +575,13 @@ pps_get_scaled_int128(union NumericChoice *c, int datalen, int target_scale,
  */
 #define PPS_MAX_FACTOR_PRECISION	18
 
-PG_FUNCTION_INFO_V1(pps_scaled_accum);
-PG_FUNCTION_INFO_V1(pps_scaled_accum_mul);
-PG_FUNCTION_INFO_V1(pps_scaled_combine);
-PG_FUNCTION_INFO_V1(pps_scaled_serialize);
-PG_FUNCTION_INFO_V1(pps_scaled_deserialize);
-PG_FUNCTION_INFO_V1(pps_scaled_sum_final);
-PG_FUNCTION_INFO_V1(pps_scaled_avg_final);
+PG_FUNCTION_INFO_V1(pps_bounded_accum);
+PG_FUNCTION_INFO_V1(pps_bounded_accum_mul);
+PG_FUNCTION_INFO_V1(pps_bounded_combine);
+PG_FUNCTION_INFO_V1(pps_bounded_serialize);
+PG_FUNCTION_INFO_V1(pps_bounded_deserialize);
+PG_FUNCTION_INFO_V1(pps_bounded_sum_final);
+PG_FUNCTION_INFO_V1(pps_bounded_avg_final);
 
 /*
  * pps_make_state
@@ -608,7 +608,7 @@ pps_make_state(MemoryContext aggcontext, int32 scale)
 }
 
 /*
- * pps_scaled_accum
+ * pps_bounded_accum
  *		Transition function: (internal, numeric, int4) -> internal.
  *
  * The third argument is the constant planted by the support function.  It is a
@@ -616,7 +616,7 @@ pps_make_state(MemoryContext aggcontext, int32 scale)
  * created and never looked at again.
  */
 Datum
-pps_scaled_accum(PG_FUNCTION_ARGS)
+pps_bounded_accum(PG_FUNCTION_ARGS)
 {
 	NasAggState *st;
 	MemoryContext aggcontext;
@@ -625,18 +625,18 @@ pps_scaled_accum(PG_FUNCTION_ARGS)
 	union NumericChoice *c;
 
 	if (!AggCheckCallContext(fcinfo, &aggcontext))
-		elog(ERROR, "pps_scaled_accum called in non-aggregate context");
+		elog(ERROR, "pps_bounded_accum called in non-aggregate context");
 
 	if (PG_ARGISNULL(0))
 	{
 		int32		scale;
 
 		if (PG_ARGISNULL(2))
-			elog(ERROR, "scale argument of pps_scaled_accum must not be null");
+			elog(ERROR, "scale argument of pps_bounded_accum must not be null");
 
 		scale = PG_GETARG_INT32(2);
 		if (scale < 0 || scale > PPS_MAX_PRECISION)
-			elog(ERROR, "unrecognised scale %d for pps_scaled_accum", scale);
+			elog(ERROR, "unrecognised scale %d for pps_bounded_accum", scale);
 
 		st = pps_make_state(aggcontext, scale);
 	}
@@ -680,7 +680,7 @@ pps_scaled_accum(PG_FUNCTION_ARGS)
 		 * is caught not here but when the mantissa is extracted -- that is,
 		 * before it can corrupt the sum.
 		 */
-		if (likely(pps_get_scaled_int128(c, datalen, st->scale, &m)))
+		if (likely(pps_get_bounded_int128(c, datalen, st->scale, &m)))
 			int128_add_int128(&st->sumX, m);
 		else
 			ereport(ERROR,
@@ -786,7 +786,7 @@ pps_mul_special(union NumericChoice *ca, int la,
 }
 
 /*
- * pps_scaled_accum_mul
+ * pps_bounded_accum_mul
  *		Transition function for a folded product:
  *		(internal, numeric, numeric, int4, int4) -> internal.
  *
@@ -809,7 +809,7 @@ pps_mul_special(union NumericChoice *ca, int la,
  * numeric_mul() would have given the product.
  */
 Datum
-pps_scaled_accum_mul(PG_FUNCTION_ARGS)
+pps_bounded_accum_mul(PG_FUNCTION_ARGS)
 {
 	NasAggState *st;
 	MemoryContext aggcontext;
@@ -826,7 +826,7 @@ pps_scaled_accum_mul(PG_FUNCTION_ARGS)
 	int64		mb;
 
 	if (!AggCheckCallContext(fcinfo, &aggcontext))
-		elog(ERROR, "pps_scaled_accum_mul called in non-aggregate context");
+		elog(ERROR, "pps_bounded_accum_mul called in non-aggregate context");
 
 	if (PG_ARGISNULL(0))
 	{
@@ -834,12 +834,12 @@ pps_scaled_accum_mul(PG_FUNCTION_ARGS)
 		int32		s2;
 
 		if (PG_ARGISNULL(3) || PG_ARGISNULL(4))
-			elog(ERROR, "scale arguments of pps_scaled_accum_mul must not be null");
+			elog(ERROR, "scale arguments of pps_bounded_accum_mul must not be null");
 
 		s1 = PG_GETARG_INT32(3);
 		s2 = PG_GETARG_INT32(4);
 		if (s1 < 0 || s2 < 0 || s1 + s2 > PPS_MAX_PRECISION)
-			elog(ERROR, "unrecognised scales %d and %d for pps_scaled_accum_mul",
+			elog(ERROR, "unrecognised scales %d and %d for pps_bounded_accum_mul",
 				 s1, s2);
 
 		st = pps_make_state(aggcontext, s1 + s2);
@@ -876,15 +876,15 @@ pps_scaled_accum_mul(PG_FUNCTION_ARGS)
 	}
 
 	/*
-	 * Each mantissa has to come out in an int64.  pps_get_scaled_int128() only
+	 * Each mantissa has to come out in an int64.  pps_get_bounded_int128() only
 	 * promises PPS_MAX_PRECISION digits, so the narrower bound is checked here
 	 * rather than assumed: the support function does guarantee it, but a
 	 * direct call to this aggregate does not, and silently truncating a
 	 * mantissa would produce a wrong sum with nothing to show for it.
 	 */
-	if (unlikely(!pps_get_scaled_int128(ca, la, PG_GETARG_INT32(3), &wide) ||
+	if (unlikely(!pps_get_bounded_int128(ca, la, PG_GETARG_INT32(3), &wide) ||
 				 !pps_int128_fits_int64(wide, &ma) ||
-				 !pps_get_scaled_int128(cb, lb, PG_GETARG_INT32(4), &wide) ||
+				 !pps_get_bounded_int128(cb, lb, PG_GETARG_INT32(4), &wide) ||
 				 !pps_int128_fits_int64(wide, &mb)))
 		ereport(ERROR,
 				(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
@@ -912,7 +912,7 @@ done:
 }
 
 /*
- * pps_scaled_combine
+ * pps_bounded_combine
  *		Merge two states during parallel aggregation.
  *
  * Without it the planner does not build a Partial Aggregate at all and the
@@ -920,14 +920,14 @@ done:
  * this function is a requirement rather than a decoration.
  */
 Datum
-pps_scaled_combine(PG_FUNCTION_ARGS)
+pps_bounded_combine(PG_FUNCTION_ARGS)
 {
 	NasAggState *st1;
 	NasAggState *st2;
 	MemoryContext aggcontext;
 
 	if (!AggCheckCallContext(fcinfo, &aggcontext))
-		elog(ERROR, "pps_scaled_combine called in non-aggregate context");
+		elog(ERROR, "pps_bounded_combine called in non-aggregate context");
 
 	st1 = PG_ARGISNULL(0) ? NULL : (NasAggState *) PG_GETARG_POINTER(0);
 	st2 = PG_ARGISNULL(1) ? NULL : (NasAggState *) PG_GETARG_POINTER(1);
@@ -957,7 +957,7 @@ pps_scaled_combine(PG_FUNCTION_ARGS)
 	 * to show for it.
 	 */
 	if (unlikely(st1->scale != st2->scale))
-		elog(ERROR, "mismatched scales in pps_scaled_combine: %d vs %d",
+		elog(ERROR, "mismatched scales in pps_bounded_combine: %d vs %d",
 			 st1->scale, st2->scale);
 
 	int128_add_int128(&st1->sumX, st2->sumX);
@@ -970,7 +970,7 @@ pps_scaled_combine(PG_FUNCTION_ARGS)
 }
 
 /*
- * pps_scaled_serialize / pps_scaled_deserialize
+ * pps_bounded_serialize / pps_bounded_deserialize
  *		Ship the state from a worker to the leader.
  *
  * The format is fixed: the scale, four counters, and the sum in two halves.
@@ -980,14 +980,14 @@ pps_scaled_combine(PG_FUNCTION_ARGS)
  * one of them.
  */
 Datum
-pps_scaled_serialize(PG_FUNCTION_ARGS)
+pps_bounded_serialize(PG_FUNCTION_ARGS)
 {
 	NasAggState *st;
 	StringInfoData buf;
 	bytea	   *result;
 
 	if (!AggCheckCallContext(fcinfo, NULL))
-		elog(ERROR, "pps_scaled_serialize called in non-aggregate context");
+		elog(ERROR, "pps_bounded_serialize called in non-aggregate context");
 
 	st = (NasAggState *) PG_GETARG_POINTER(0);
 
@@ -1005,7 +1005,7 @@ pps_scaled_serialize(PG_FUNCTION_ARGS)
 }
 
 Datum
-pps_scaled_deserialize(PG_FUNCTION_ARGS)
+pps_bounded_deserialize(PG_FUNCTION_ARGS)
 {
 	bytea	   *sstate;
 	NasAggState *st;
@@ -1016,7 +1016,7 @@ pps_scaled_deserialize(PG_FUNCTION_ARGS)
 	uint64		lo;
 
 	if (!AggCheckCallContext(fcinfo, &aggcontext))
-		elog(ERROR, "pps_scaled_deserialize called in non-aggregate context");
+		elog(ERROR, "pps_bounded_deserialize called in non-aggregate context");
 
 	sstate = PG_GETARG_BYTEA_PP(0);
 
@@ -1203,17 +1203,17 @@ pps_sum_numeric(NasAggState *st)
 }
 
 /*
- * pps_scaled_sum_final
+ * pps_bounded_sum_final
  *		Final function for the sum: (internal) -> numeric.
  */
 Datum
-pps_scaled_sum_final(PG_FUNCTION_ARGS)
+pps_bounded_sum_final(PG_FUNCTION_ARGS)
 {
 	NasAggState *st;
 	Datum		result = (Datum) 0;
 
 	if (!AggCheckCallContext(fcinfo, NULL))
-		elog(ERROR, "pps_scaled_sum_final called in non-aggregate context");
+		elog(ERROR, "pps_bounded_sum_final called in non-aggregate context");
 
 	st = PG_ARGISNULL(0) ? NULL : (NasAggState *) PG_GETARG_POINTER(0);
 
@@ -1231,7 +1231,7 @@ pps_scaled_sum_final(PG_FUNCTION_ARGS)
 }
 
 /*
- * pps_scaled_avg_final
+ * pps_bounded_avg_final
  *		Final function for the average: (internal) -> numeric.
  *
  * This is numeric_avg() with our sum in place of theirs.  Everything that
@@ -1246,7 +1246,7 @@ pps_scaled_sum_final(PG_FUNCTION_ARGS)
  * core shares numeric_avg_accum between the two.
  */
 Datum
-pps_scaled_avg_final(PG_FUNCTION_ARGS)
+pps_bounded_avg_final(PG_FUNCTION_ARGS)
 {
 	NasAggState *st;
 	Datum		result = (Datum) 0;
@@ -1254,7 +1254,7 @@ pps_scaled_avg_final(PG_FUNCTION_ARGS)
 	Datum		n_datum;
 
 	if (!AggCheckCallContext(fcinfo, NULL))
-		elog(ERROR, "pps_scaled_avg_final called in non-aggregate context");
+		elog(ERROR, "pps_bounded_avg_final called in non-aggregate context");
 
 	st = PG_ARGISNULL(0) ? NULL : (NasAggState *) PG_GETARG_POINTER(0);
 

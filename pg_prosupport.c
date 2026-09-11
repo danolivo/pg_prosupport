@@ -60,7 +60,7 @@ static agg_simplify_hook_type prev_agg_simplify_hook = NULL;
  * runs before any query of this session is planned, well before
  * pps_agg_simplify_hook() can ever be called.  Until _PG_init() has
  * finished, though, the plan cache must not be touched; see
- * pps_assign_numeric_agg() and pps_assign_fold_const_sum().
+ * pps_assign_bounded_numeric_agg() and pps_assign_fold_const_sum().
  */
 static bool pps_ready = false;
 
@@ -75,7 +75,7 @@ static bool pps_ready = false;
  * logging -- and this function does not look inside any of them.  They are
  * tried in a fixed order rather than independently: sum() over a numeric
  * constant, with both switches on, could equally be eliminated by
- * pps_simplify_const_sum() or narrowed by pps_simplify_scaled_numeric_agg(),
+ * pps_simplify_const_sum() or narrowed by pps_simplify_bounded_numeric_agg(),
  * and eliminating the aggregation outright is strictly the better plan, so
  * the constant fold goes first and whichever returns non-NULL first wins.
  * With pps_fold_const_sum off (the default), that case simply falls through
@@ -90,7 +90,7 @@ pps_agg_simplify_hook(PlannerInfo *root, Aggref *aggref)
 	if (result != NULL)
 		return result;
 
-	result = pps_simplify_scaled_numeric_agg(root, aggref);
+	result = pps_simplify_bounded_numeric_agg(root, aggref);
 	if (result != NULL)
 		return result;
 
@@ -98,7 +98,7 @@ pps_agg_simplify_hook(PlannerInfo *root, Aggref *aggref)
 }
 
 /*
- * pps_assign_numeric_agg
+ * pps_assign_bounded_numeric_agg
  *		Flush the plan cache when the switch is flipped.
  *
  * Without this the off switch does not switch anything off: a saved generic
@@ -112,7 +112,7 @@ pps_agg_simplify_hook(PlannerInfo *root, Aggref *aggref)
  * The hook runs before the variable is assigned, hence the comparison rather
  * than an unconditional flush.
  *
- * The delicate part is pps_ready.  If pg_prosupport.numeric_agg = off already
+ * The delicate part is pps_ready.  If pg_prosupport.bounded_numeric_agg = off already
  * sat in a placeholder GUC when this module loaded -- from postgresql.conf
  * together with shared_preload_libraries, or from an earlier SET in the
  * session together with session_preload_libraries or LOAD --
@@ -124,9 +124,9 @@ pps_agg_simplify_hook(PlannerInfo *root, Aggref *aggref)
  * flush.
  */
 static void
-pps_assign_numeric_agg(bool newval, void *extra)
+pps_assign_bounded_numeric_agg(bool newval, void *extra)
 {
-	if (pps_ready && pps_numeric_agg != newval)
+	if (pps_ready && pps_bounded_numeric_agg != newval)
 		ResetPlanCache();
 }
 
@@ -141,31 +141,29 @@ pps_assign_fold_const_sum(bool newval, void *extra)
 void
 _PG_init(void)
 {
-	DefineCustomBoolVariable("pg_prosupport.numeric_agg",
+	DefineCustomBoolVariable("pg_prosupport.bounded_numeric_agg",
 							 "Specialise sum()/avg() over a numeric of bounded precision and scale.",
 							 "This is the rewrite in numeric_support.c: sum()/avg() "
-							 "narrowed to numeric_scaled_sum_expr/numeric_scaled_avg "
+							 "narrowed to bounded_numeric_sum/bounded_numeric_avg "
 							 "(and the product fold on top of it), whenever the "
 							 "argument's precision and scale are known and small "
-							 "enough.  On by default, like patch 2's core-level "
-							 "substitution for the plain-column case this extends: "
-							 "narrowing an accumulator is not a change of plan "
-							 "shape a DBA needs to opt into.",
-							 &pps_numeric_agg,
+							 "enough.  On by default: narrowing an accumulator is "
+							 "not a change of plan shape a DBA needs to opt into.",
+							 &pps_bounded_numeric_agg,
 							 true,
 							 PGC_USERSET,
 							 0,
-							 NULL, pps_assign_numeric_agg, NULL);
+							 NULL, pps_assign_bounded_numeric_agg, NULL);
 
 	DefineCustomBoolVariable("pg_prosupport.fold_const_sum",
 							 "Replace sum() over a constant argument with a multiplication of count(*).",
 							 "This is the transformation in constagg.c, which "
 							 "removes the aggregation instead of specialising "
-							 "it.  Off by default -- unlike pg_prosupport.numeric_agg, "
+							 "it.  Off by default -- unlike pg_prosupport.bounded_numeric_agg, "
 							 "this one changes the shape of the query's expression "
 							 "tree, not just an aggregate's accumulator, so it is "
 							 "opt-in.  It is switched separately from "
-							 "pg_prosupport.numeric_agg because the two rewrites "
+							 "pg_prosupport.bounded_numeric_agg because the two rewrites "
 							 "fail in different ways.",
 							 &pps_fold_const_sum,
 							 false,

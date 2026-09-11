@@ -68,12 +68,12 @@ EXPLAIN (verbose, costs off) SELECT sum(v) FROM t_const;
 
 --
 -- The switch.  pg_prosupport.fold_const_sum takes out this transformation
--- alone -- but pg_prosupport.numeric_agg (see numeric_agg.sql), still on, is
+-- alone -- but pg_prosupport.bounded_numeric_agg (see numeric_agg.sql), still on, is
 -- a second, entirely independent rewrite that is equally happy to take a
 -- numeric constant as its argument (a constant's precision and scale are
 -- just as derivable as a column's; see pps_const_bounds() in
 -- numeric_support.c), so sum('0'::numeric) does not fall all the way back to
--- a plain sum() here -- it falls back one step, to numeric_scaled_sum_expr.
+-- a plain sum() here -- it falls back one step, to bounded_numeric_sum.
 -- Turning both off (see the values section below) is what gets back to
 -- plain sum().
 --
@@ -85,12 +85,12 @@ SET pg_prosupport.fold_const_sum = on;
 -- The values.  The rewrite has to reproduce core exactly, dscale included, so
 -- the reference is taken with both of the extension's rewrites switched off
 -- -- fold_const_sum alone is not enough here, since numeric_support.c's own
--- rewrite (pg_prosupport.numeric_agg, still on) would otherwise pick up the
+-- rewrite (pg_prosupport.bounded_numeric_agg, still on) would otherwise pick up the
 -- very same sum(<constant>) itself and the comparison would validate one
 -- rewrite against the other rather than against real pg_catalog.sum.
 --
 SET pg_prosupport.fold_const_sum = off;
-SET pg_prosupport.numeric_agg = off;
+SET pg_prosupport.bounded_numeric_agg = off;
 CREATE TABLE t_constref AS
 	SELECT grp,
 		   sum('0'::numeric)::text						AS s1,
@@ -103,7 +103,7 @@ CREATE TABLE t_constref AS
 		   (sum('2.5'::numeric) FILTER (WHERE v > 5))::text AS s8
 	FROM t_const GROUP BY grp;
 SET pg_prosupport.fold_const_sum = on;
-SET pg_prosupport.numeric_agg = on;
+SET pg_prosupport.bounded_numeric_agg = on;
 
 SELECT count(*) AS const_mismatches
 FROM t_constref r

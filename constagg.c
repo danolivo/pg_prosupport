@@ -70,13 +70,13 @@
 
 /*
  * The off switch for this transformation alone.  It is separate from
- * pg_prosupport.numeric_agg because the two optimisations fail in
+ * pg_prosupport.bounded_numeric_agg because the two optimisations fail in
  * different ways: the specialised aggregates can be wrong about a scale,
  * whereas this one changes the expression tree of a query.  Whoever has to
  * decide at three in the morning which of the two to take out should not have
  * to take out both.
  *
- * Off by default, unlike pg_prosupport.numeric_agg.  numeric_support.c's
+ * Off by default, unlike pg_prosupport.bounded_numeric_agg.  numeric_support.c's
  * rewrite only ever changes which function accumulates the same aggregate;
  * this one removes the aggregate from the plan altogether and replaces it
  * with an equivalent built from count(*) -- a bigger change of plan shape,

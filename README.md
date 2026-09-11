@@ -3,67 +3,59 @@
 Extra PostgreSQL query tree optimisations that might be done with the prosupport
 machinery.
 
-Two PostgreSQL patches, plus an extension that builds on top of the first of
-them.
+One PostgreSQL patch, plus an extension that builds on top of it.
 
-**Patch 2, `patches/pg18-numeric-scaled-sum-catalog.patch`, moves the single
-most valuable case into core outright.** `sum(numeric)` over an argument
-whose precision and scale are known from a plain typmod — a column, a cast,
-a `CASE`, a domain — is substituted for `pg_catalog.numeric_scaled_sum(numeric,
-int4)`, a real catalog aggregate, by a direct, unconditional function call —
-`simplify_sum_numeric_aggref()` in `numeric.c`, called from
-`eval_const_expressions_mutator()` — not by a hook a module has to install.
-This needs **no extension and no `CREATE EXTENSION`** to work: it is core
-behaviour on any database, the moment the patch is applied and the server
-rebuilt. See that patch file's own header for the design and the numbers.
+**`patches/0001-Introduce-agg_simplify_hook-to-postgres-18.patch` adds
+`agg_simplify_hook`**, a single planner hook: the planner calls it, if set,
+for every `Aggref` it meets while simplifying the query tree, and whatever
+non-`NULL` node the hook returns takes the `Aggref`'s place — the same point
+in planning, and the same shape of rewrite, that PostgreSQL 19's
+`SupportRequestSimplifyAggref` reaches through `pg_proc.prosupport` (commit
+`42473b3b31`, which turns `COUNT(1)` into `COUNT(*)`). Unlike that
+catalog-driven dispatch, `agg_simplify_hook` is a plain global hook — in the
+same family as `planner_hook`, `set_rel_pathlist_hook` and
+`join_search_hook` — added to the planner on purpose in favour of the
+catalog machinery: no `pg_proc.prosupport` write, no `pg_depend` bookkeeping,
+no per-aggregate attachment to get wrong. This is the pre-PG19 target: on a
+server old enough not to have `SupportRequestSimplifyAggref` at all, this one
+hook is the only entry point any of the rewrites below need.
 
-**Patch 1, `patches/pg18-agg-simplify-hook.patch`, adds `agg_simplify_hook`**,
-a single planner hook: the planner calls it, if set, for every `Aggref` it
-meets while simplifying the query tree, and whatever non-`NULL` node the hook
-returns takes the `Aggref`'s place — the same point in planning, and the same
-shape of rewrite, that PostgreSQL 19's `SupportRequestSimplifyAggref` reaches
-through `pg_proc.prosupport` (commit `42473b3b31`, which turns `COUNT(1)`
-into `COUNT(*)`). Unlike that catalog-driven dispatch, `agg_simplify_hook` is
-a plain global hook — in the same family as `planner_hook`,
-`set_rel_pathlist_hook` and `join_search_hook` — added to the planner on
-purpose in favour of the catalog machinery: no `pg_proc.prosupport` write, no
-`pg_depend` bookkeeping, no per-aggregate attachment to get wrong. It runs
-*after* patch 2's direct call, only for whatever that one declined.
-
-**This extension is a home for rewrites reached through that hook** — the
-ones that are not (yet, or ever) unconditional enough to bake into core the
-way patch 2's case was. Its own hook function decides, from
-`aggref->aggfnoid` alone, which aggregates it wants and leaves everything
-else — the overwhelming majority of calls — alone.
+**This extension is where every rewrite reached through that hook lives** --
+all of them, with nothing left for core to do unconditionally. Its own hook
+function, `pps_agg_simplify_hook()` in `pg_prosupport.c`, decides, from
+`aggref->aggfnoid` and its arguments alone, which aggregates it wants and
+leaves everything else — the overwhelming majority of calls — alone. That
+includes the case that would be the obvious candidate for a core-level
+shortcut, a plain `sum(column)` whose typmod is known outright: it reaches
+this hook exactly the same way `sum(a + b)` or `avg(column)` does, and is
+recognised the same way, through `pps_derive_bounds()`.
 
 `numeric_agg`/`const_agg` (`make installcheck`) pass against a PG18 built
-with both patches, and PG18's own `make check` (231/231) is unaffected by
-either: patch 2's substitution is silent in `EXPLAIN` except for the
-aggregate's name, and patch 1's hook is `NULL` — one predicted-not-taken
-branch per `Aggref` — on a server where nothing has installed it.
+with the patch, and PG18's own `make check` (231/231) is unaffected by it:
+the hook is `NULL` — one predicted-not-taken branch per `Aggref` — on a
+server where nothing has installed it.
 
 Rewrites, where they live, and what governs them:
 
 | rewrite | where | governed by |
 |---|---|---|
-| `sum(a)` — `a` typmod-derivable → `pg_catalog.numeric_scaled_sum(a, s)` | core, `numeric.c` (**patch 2**) | nothing; always on, no extension needed |
-| `avg(a)` typmod-derivable, or `sum(a)`/`avg(a)` derivable only through arithmetic (`a+b`, `round(a*b,2)`, …) → `numeric_scaled_avg`/`numeric_scaled_sum_expr` | `numeric_support.c`, `numeric_agg.c` | `pg_prosupport.numeric_agg` — **on** by default |
+| `sum(a)`/`avg(a)` — `a` typmod-derivable, or derivable only through arithmetic (`a+b`, `round(a*b,2)`, …) → `bounded_numeric_sum`/`bounded_numeric_avg` | `numeric_support.c`, `numeric_agg.c` | `pg_prosupport.bounded_numeric_agg` — **on** by default |
 | `sum(c)` for a constant `c` → `c * NULLIF(count(*), 0)::numeric`; the aggregation disappears | `constagg.c` | `pg_prosupport.fold_const_sum` — **off** by default |
 
-The two extension-level rewrites are independent: `pg_prosupport.c`'s
+The two rewrites are independent: `pg_prosupport.c`'s
 `pps_agg_simplify_hook()` is a fixed sequence of two calls, one per module,
 each recognising its own aggregate shape and consulting only its own GUC --
 not one nested inside the other, and not a single switch governing both.
-`pg_prosupport.numeric_agg` only narrows which function accumulates an
-aggregate that was going to run anyway, the same idea patch 2 already applies
-to a plain `sum(column)` in core with no switch at all, so it defaults to on.
-`pg_prosupport.fold_const_sum` removes the aggregate from the plan outright,
-a bigger change of plan shape, so it defaults to off and is opt-in. When both
-are on and a query is `sum()` over a numeric constant -- the one shape either
-could take -- the constant fold is tried first and wins, since eliminating
-the aggregation is strictly better than merely narrowing it; with
-`fold_const_sum` off (the default), that same query falls through to
-`numeric_agg` instead, one step less thorough but still on.
+`pg_prosupport.bounded_numeric_agg` only narrows which function accumulates
+an aggregate that was going to run anyway -- a plan-shape-preserving change --
+so it defaults to on. `pg_prosupport.fold_const_sum` removes the aggregate
+from the plan outright, a bigger change of plan shape, so it defaults to off
+and is opt-in. When both are on and a query is `sum()` over a numeric
+constant -- the one shape either could take -- the constant fold is tried
+first and wins, since eliminating the aggregation is strictly better than
+merely narrowing it; with `fold_const_sum` off (the default), that same
+query falls through to `bounded_numeric_agg` instead, one step less thorough
+but still on.
 
 Grouped aggregation over a plain column: 42–52% off the time, 68–70% off the
 hash-table memory, and the HashAgg spill point three times further out.
@@ -101,18 +93,18 @@ Load the extension first.
 
 ## Loading the extension
 
-`sum(amount)` over a plain typmod-derivable argument needs none of this: it
-is patch 2's doing, in core, whether or not `pg_prosupport` is even
-installed in the database. Everything below is about the *rest* of the
-rewrites — `avg()`, the arithmetic-expression and product-folded forms of
-`sum()`/`avg()`, and the constant fold — which do go through
-`agg_simplify_hook` and do need the extension loaded.
+Every rewrite this extension makes -- the plain-column and
+arithmetic-expression forms of `sum()`/`avg()`, the product fold, and the
+constant fold -- goes through `agg_simplify_hook`, so all of them need the
+extension loaded. There is no rewrite that works with only `CREATE EXTENSION`
+and no rewrite that works with only the library loaded; both steps below are
+required.
 
 There is no catalog attachment step, unlike a `SupportRequestSimplify`-based
 rewrite reached through `pg_proc.prosupport`: `agg_simplify_hook` is
 installed once, by `_PG_init()`, when the shared library is loaded — and
 that is the one thing `CREATE EXTENSION` on its own does *not* do. It
-creates `numeric_scaled_sum_expr` and the rest as ordinary catalog objects,
+creates `bounded_numeric_sum` and the rest as ordinary catalog objects,
 but the library itself is only `dlopen()`ed when one of its C functions is
 actually called, which none of these are until an `Aggref` has already been
 rewritten to name one. For the hook to ever run, load the library through
@@ -131,36 +123,34 @@ LOAD 'pg_prosupport';
 `session_preload_libraries` works the same way as `shared_preload_libraries`
 but per-session rather than per-cluster. Either way, `CREATE EXTENSION
 pg_prosupport;` is still needed once per database, to create
-`numeric_scaled_sum_expr` and its siblings — loading the library alone
+`bounded_numeric_sum` and its siblings — loading the library alone
 installs the hook but creates no aggregates for it to substitute.
 
 Check:
 
 ```sql
 EXPLAIN (verbose, costs off) SELECT sum(amount), avg(amount) FROM docs;
---   Output: numeric_scaled_sum(amount, 2), avg(amount)
+--   Output: bounded_numeric_sum(amount, 2), bounded_numeric_avg(amount, 2)
 ```
 
-`sum(amount)` is rewritten by core regardless of whether `pg_prosupport` is
-loaded (patch 2); `avg(amount)`, here, was not, because the extension is not
-loaded — with it loaded, this would read `numeric_scaled_avg(amount, 2)`
-instead. Why an *extension* rewrite (never core's) was not applied:
+Both are rewritten once the extension is loaded and its aggregates created;
+with the library not loaded, or `pg_prosupport.bounded_numeric_agg` off,
+`EXPLAIN` would show plain `sum(amount)`/`avg(amount)` instead. If one of the
+two is left alone while the other is rewritten, that means its precision and
+scale could not be derived -- `avg()` and `sum()` are declined independently,
+by the same function, from the same typmod check:
 
 ```sql
 SET client_min_messages = debug1;
-EXPLAIN SELECT avg(amount) FROM docs;
+EXPLAIN SELECT avg(some_untyped_expr) FROM docs;
 -- DEBUG:  pg_prosupport: leaving avg() alone: could not derive a precision and
 --         scale for the argument within the supported range
 ```
 
-(`sum(amount)` would print no such message either way: patch 2's substitution
-is unconditional and does not decline out loud — there is nothing to log
-about a rewrite that is never wrong.)
-
 There is no equivalent of writing `pg_proc.prosupport` back to zero to detach
 the extension in one session while it stays installed elsewhere — the hook,
 once loaded, applies to every database in the cluster (or every session that
-loads it, with `session_preload_libraries`/`LOAD`). `SET pg_prosupport.numeric_agg
+loads it, with `session_preload_libraries`/`LOAD`). `SET pg_prosupport.bounded_numeric_agg
 = off` (see Disabling, below) is the per-session and per-database way to stop
 that rewrite without touching how the library is loaded, and `DROP EXTENSION
 pg_prosupport;` can be run at any time, in any order, without special care:
@@ -193,12 +183,9 @@ make USE_PGXS=1 PG_CONFIG=/path/to/bin/pg_config installcheck PGPORT=5432
 `numeric_agg` covers the scale specialisation, `const_agg` the constant
 rewrite. Both `LOAD 'pg_prosupport';` the way this README does, so they
 exercise `agg_simplify_hook` end to end -- which means the server under test
-needs both `patches/pg18-agg-simplify-hook.patch` and
-`patches/pg18-numeric-scaled-sum-catalog.patch` (or an equivalent for
-whichever version you are building) applied, not just PostgreSQL 15 or later
-for numeric's typmod encoding. Applying patch 2 adds new `pg_proc`/
-`pg_aggregate` rows, so a data directory built before it cannot be reused --
-`initdb` again after applying it.
+needs `patches/0001-Introduce-agg_simplify_hook-to-postgres-18.patch` (or an
+equivalent for whichever version you are building) applied, not just
+PostgreSQL 15 or later for numeric's typmod encoding.
 
 ## sum() over a constant
 
@@ -266,34 +253,31 @@ The aggregate must be `sum(numeric)` or `avg(numeric)` with no `DISTINCT`,
 `ORDER BY`, `FILTER` or `VARIADIC`, and the argument's precision and scale must
 come out at `1 <= p <= 28`, `0 <= s <= p`.
 
-Which of the two mechanisms catches a given call is not a free choice, and it
-is worth being precise about the boundary. **Patch 2, in core**, handles
-`sum(numeric)` alone, only when the sole argument's typmod can be read off
-directly — a column, a cast, a `CASE`, a domain — and only when that argument
-is not a bare constant (a constant is left for `constagg.c`'s better rewrite,
-below, to have first refusal on). **The extension's hook** handles
-everything patch 2 does not: `avg(numeric)` in every shape, `sum(numeric)`
-whose argument is an *arithmetic expression* rather than a plain typmod
-(`a + b`, `a * b`, `round(a * b, 2)`, …, via `pps_derive_bounds()`'s
-recursion through `OpExpr`/`FuncExpr`), and the product-folded forms of both.
-The two never compete for the same `Aggref`: core's call runs first and,
-when it substitutes, the `Aggref` is already gone by the time
-`agg_simplify_hook` would have seen it.
+`sum(numeric)` and `avg(numeric)` are both handled the same way, by the same
+function, `pps_simplify_bounded_numeric_agg()`: whether the argument's
+precision and scale can be read off directly — a column, a cast, a `CASE`, a
+domain — or only by walking an *arithmetic expression* (`a + b`, `a * b`,
+`round(a * b, 2)`, …, via `pps_derive_bounds()`'s recursion through
+`OpExpr`/`FuncExpr`), there is one code path for both, and one GUC governing
+both. A bare numeric constant is left alone here for `constagg.c`'s better
+rewrite to have first refusal on (see above); everything else reaches this
+function the same way regardless of whether the argument is a plain column
+or an expression built out of several.
 
 Those come either from a declared typmod or from arithmetic over declared
 operands:
 
-| argument | derived | rewritten by |
+| argument | derived | rewritten? |
 |---|---|---|
-| `a` — `numeric(10,2)` | `(10,2)` | core (patch 2) |
-| `b` — `avg(b)`, `b` is `numeric(10,2)` | `(10,2)` | extension |
-| `a * b` — `(10,2)`, `(12,4)` | `(22,6)` | extension |
-| `a + b`, `a - b` | `(13,4)` | extension |
-| `-a` | `(10,2)` | extension |
-| `a * b + a` | `(23,6)` | extension |
-| `a * 1.2` | `(13,3)` | extension |
-| `a * b::numeric(14,4)` | `(24,6)` | extension |
-| `round(a * b, 2)`, `trunc(a * b, 2)` | `(19,2)` | extension |
+| `a` — `numeric(10,2)` | `(10,2)` | yes |
+| `b` — `avg(b)`, `b` is `numeric(10,2)` | `(10,2)` | yes |
+| `a * b` — `(10,2)`, `(12,4)` | `(22,6)` | yes |
+| `a + b`, `a - b` | `(13,4)` | yes |
+| `-a` | `(10,2)` | yes |
+| `a * b + a` | `(23,6)` | yes |
+| `a * 1.2` | `(13,3)` | yes |
+| `a * b::numeric(14,4)` | `(24,6)` | yes |
+| `round(a * b, 2)`, `trunc(a * b, 2)` | `(19,2)` | yes |
 | `a * c` — `c` is `numeric(20,10)` | `(30,12)` | no, `p > 28` |
 | `a / b`, `a / 100` | — | no, the quotient's scale depends on the values |
 | `round(a, n)` — `n` is not constant | — | no |
@@ -303,17 +287,15 @@ A product sitting at the top of the argument gets one step more: instead of
 being computed per row and then accumulated, it is taken apart and both factors
 are handed to the aggregate, which multiplies them as integers. That needs each
 factor to derive at 18 digits or fewer, since the two mantissas have to fit
-int64s; the sum of the two precisions still has to stay within 28. This is
-the extension's own rewrite in every row below — a product is never at the
-top of a *plain* typmod argument, so core's direct call never enters into it.
+int64s; the sum of the two precisions still has to stay within 28.
 
 | argument | aggregate | why |
 |---|---|---|
-| `a * b` | `numeric_scaled_sum_mul(a, b, 2, 4)` | folded |
-| `(a + 1) * b` | `numeric_scaled_sum_mul((a+1), b, 2, 4)` | factors may be expressions |
-| `a * b * a` | `numeric_scaled_sum_mul((a*b), a, 6, 2)` | nests; the inner product is still `numeric_mul` |
-| `a * b + a` | `numeric_scaled_sum_expr((a*b)+a, 6)` | the product is not at the top |
-| `d * e` — `d` is `numeric(20,2)` | `numeric_scaled_sum_expr(d*e, 4)` | a factor wider than 18 digits |
+| `a * b` | `bounded_numeric_sum_mul(a, b, 2, 4)` | folded |
+| `(a + 1) * b` | `bounded_numeric_sum_mul((a+1), b, 2, 4)` | factors may be expressions |
+| `a * b * a` | `bounded_numeric_sum_mul((a*b), a, 6, 2)` | nests; the inner product is still `numeric_mul` |
+| `a * b + a` | `bounded_numeric_sum((a*b)+a, 6)` | the product is not at the top |
+| `d * e` — `d` is `numeric(20,2)` | `bounded_numeric_sum(d*e, 4)` | a factor wider than 18 digits |
 
 The rules are the ones numeric itself guarantees: a product has scale `s1 + s2`
 and at most `p1 + p2` digits, a sum or difference has scale `max(s1, s2)` and at
@@ -358,36 +340,27 @@ DETAIL:  The aggregate was specialised on the argument's declared type;
          a row source supplied a value outside that declaration.
 ```
 
-For `avg()`, or for `sum()` over an arithmetic expression -- both reached
-through `pg_prosupport.numeric_agg` -- `SET pg_prosupport.numeric_agg = off`
-is the immediate cure, before going after the row source. If the error came
-from the constant fold instead (`sum()` over a numeric literal, with
-`pg_prosupport.fold_const_sum` on), `SET pg_prosupport.fold_const_sum = off`
-is the one to reach for.
-
-For a plain `sum(column)`, there is no session-level switch: patch 2 put that
-substitution in core, unconditionally, on the premise that it is never wrong
-to do -- so this error means the premise was actually violated (a typmod that
-does not hold), which is a data problem worth fixing at the source rather
-than a rewrite worth turning off. The only way to stop core's substitution
-itself is to not apply `pg_18-numeric-scaled-sum-catalog.patch` (or to revert
-and rebuild without it), which needs a restart either way.
+For any of `sum()`/`avg()` over a plain column or over an arithmetic
+expression -- all reached through `pg_prosupport.bounded_numeric_agg` --
+`SET pg_prosupport.bounded_numeric_agg = off` is the immediate cure, before
+going after the row source. If the error came from the constant fold instead
+(`sum()` over a numeric literal, with `pg_prosupport.fold_const_sum` on),
+`SET pg_prosupport.fold_const_sum = off` is the one to reach for.
 
 ## Disabling
 
 Three levels, from soft to hard -- all of them scoped to the extension's own
-rewrites (`avg()`, `sum()`/`avg()` over an arithmetic expression, the product
-fold, and the constant fold). `sum(column)` over a plain typmod is core's
-doing (patch 2) and none of these switches reach it; see above.
+rewrites (`sum()`/`avg()` over a plain column or an arithmetic expression,
+the product fold, and the constant fold).
 
 **Per session or per database** — GUCs, no superuser needed. Two switches,
 each governing exactly one of `pps_agg_simplify_hook()`'s two calls (see the
 table above) and neither one reaching into the other:
 
 ```sql
-SET pg_prosupport.numeric_agg = off;            -- avg(), and sum()/avg() over an expression; on by default
+SET pg_prosupport.bounded_numeric_agg = off;    -- sum()/avg() over a column or an expression; on by default
 SET pg_prosupport.fold_const_sum = off;         -- only sum() over a constant; off by default
-ALTER DATABASE mydb SET pg_prosupport.numeric_agg = off;
+ALTER DATABASE mydb SET pg_prosupport.bounded_numeric_agg = off;
 ```
 
 Either of them flushes the plan cache in the session that runs it, so it takes
@@ -397,11 +370,10 @@ backends pick it up when they next set it themselves.
 They are separate switches because the two rewrites fail in different ways --
 the specialised aggregates can be wrong about a scale, whereas the constant
 rewrite changes the expression tree of a query -- and because they default
-differently: `numeric_agg` only narrows an accumulator, the same kind of
-change patch 2 already makes in core with no switch at all, so it is on by
-default; `fold_const_sum` removes the aggregate from the plan outright, which
-is worth opting into rather than discovering after the fact, so it defaults
-to off.
+differently: `bounded_numeric_agg` only narrows an accumulator, a
+plan-shape-preserving change, so it is on by default; `fold_const_sum`
+removes the aggregate from the plan outright, which is worth opting into
+rather than discovering after the fact, so it defaults to off.
 
 **Entirely** — remove `pg_prosupport` from `shared_preload_libraries` (or
 `session_preload_libraries`) and restart/reconnect; a session that loaded it

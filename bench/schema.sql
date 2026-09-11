@@ -7,7 +7,7 @@
 --
 -- Nothing here depends on the extension; the same tables are used to measure
 -- the stock aggregates and the substituted ones, switched with
--- pg_prosupport.numeric_agg.
+-- pg_prosupport.bounded_numeric_agg.
 --
 
 DROP TABLE IF EXISTS pps_bench;
