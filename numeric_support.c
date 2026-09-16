@@ -94,7 +94,6 @@ static Oid	pps_bounded_avg_oid = InvalidOid;
 static Oid	pps_bounded_sum_mul_oid = InvalidOid;
 static Oid	pps_bounded_avg_mul_oid = InvalidOid;
 static bool pps_cache_valid = false;
-static bool pps_oids_ok = false;
 
 /*
  * Dropped on any change to pg_proc, not just to our two rows.  Comparing
@@ -106,7 +105,6 @@ void
 pps_syscache_reset(Datum arg, int cacheid, uint32 hashvalue)
 {
 	pps_cache_valid = false;
-	pps_oids_ok = false;
 }
 
 /* numeric typmod -> precision and scale; the scale is sign-extended */
@@ -133,27 +131,19 @@ pps_typmod_scale(int32 typmod)
  * function, agg_simplify_hook carries no OID of "self" to start from, so the
  * schema comes from pg_extension via get_extension_oid()/
  * get_extension_schema() instead of get_func_namespace().
- *
- * Returns false when our aggregates are missing: the extension may have been
- * dropped without the hook being cleared (which normally cannot happen --
- * see the note on unloading in pg_prosupport.c -- but a stale cache entry
- * from before a DROP EXTENSION/CREATE EXTENSION cycle in the same backend is
- * exactly this case), and there is no reason to fail planning over that --
- * the query simply computes the stock aggregate.  A missing built-in, on the
- * other hand, means a broken catalog, and that is an error rather than a
- * reason to carry on quietly.
  */
-static bool
+static void
 pps_load_oids(void)
 {
 	Oid			extoid;
 	Oid			nsp;
-	Oid			builtin_args[1] = {NUMERICOID};
-	Oid			bounded_args[2] = {NUMERICOID, INT4OID};
-	Oid			mul_args[4] = {NUMERICOID, NUMERICOID, INT4OID, INT4OID};
+	const Oid	builtin_args[1] = {NUMERICOID};
+	const Oid	bounded_args[2] = {NUMERICOID, INT4OID};
+	const Oid	mul_args[4] = {NUMERICOID, NUMERICOID, INT4OID, INT4OID};
+	bool		pps_oids_ok = false;
 
 	if (pps_cache_valid)
-		return pps_oids_ok;
+		return;
 
 	pps_sum_numeric_oid = LookupFuncName(list_make2(makeString("pg_catalog"),
 													makeString("sum")),
@@ -164,8 +154,8 @@ pps_load_oids(void)
 	if (!OidIsValid(pps_sum_numeric_oid) || !OidIsValid(pps_avg_numeric_oid))
 		elog(ERROR, "could not find pg_catalog.sum(numeric) or pg_catalog.avg(numeric)");
 
-	extoid = get_extension_oid("pg_prosupport", true);
-	nsp = OidIsValid(extoid) ? get_extension_schema(extoid) : InvalidOid;
+	extoid = get_extension_oid("pg_prosupport", false);
+	nsp = get_extension_schema(extoid);
 	if (OidIsValid(nsp))
 	{
 		char	   *nspname = get_namespace_name(nsp);
@@ -187,13 +177,6 @@ pps_load_oids(void)
 									  makeString("bounded_numeric_avg_mul")),
 						   4, mul_args, true);
 	}
-	else
-	{
-		pps_bounded_sum_oid = InvalidOid;
-		pps_bounded_avg_oid = InvalidOid;
-		pps_bounded_sum_mul_oid = InvalidOid;
-		pps_bounded_avg_mul_oid = InvalidOid;
-	}
 
 	pps_oids_ok = OidIsValid(pps_bounded_sum_oid) &&
 		OidIsValid(pps_bounded_avg_oid) &&
@@ -202,11 +185,11 @@ pps_load_oids(void)
 	pps_cache_valid = true;
 
 	if (!pps_oids_ok)
-		elog(DEBUG1, "pg_prosupport: the specialised aggregates were "
+		elog(ERROR, "pg_prosupport: the specialised aggregates were "
 			 "not found; the extension does not appear to be created "
 			 "in this database");
 
-	return pps_oids_ok;
+	return;
 }
 
 /*
@@ -585,19 +568,14 @@ pps_scale_const(int value, AttrNumber resno)
 
 /*
  * pps_simplify_bounded_numeric_agg
- *		The scale-specialisation rewrite alone: sum(numeric)/avg(numeric)
- *		narrowed to a bounded accumulator, including the product fold.
- *		Called once for every Aggref the planner meets (see
- *		pps_agg_simplify_hook() in pg_prosupport.c), so the first thing it
- *		does is decide, from aggfnoid alone, whether it has any business with
- *		this one at all.
  *
- * Returns the replacement node, or NULL to leave the aggregate alone.  A
- * constant argument is not treated specially here any more -- see
- * constagg.c for the rewrite that used to be tried first for that shape;
- * this function is tried after it (see pps_agg_simplify_hook()) and simply
- * narrows the accumulator for a constant the same way it would for a column,
- * whenever constagg.c's own rewrite is off or declines.
+ *	Prosupport routine to replace a SUM() or AVG() aggregate with corresponding
+ * specialised version in case when limitations of the input allows to use a
+ * bounded accumulator.
+ *
+ * It is called once for every Aggref the planner meets.
+ *
+ * Returns the replacement node, or NULL if this optimisation can't be applied.
  *
  * root is unused today -- there is nothing here that needs the planner's
  * infrastructure beyond the Aggref itself -- but it is part of
@@ -617,36 +595,13 @@ pps_simplify_bounded_numeric_agg(struct PlannerInfo *root, Aggref *agg)
 				s2;
 	Oid			newfn;
 	Aggref	   *newagg;
-	bool		bounded_ok;
 
-	/*
-	 * pps_load_oids() prints its own reason when the specialised aggregates
-	 * cannot be found.  That is no longer a reason to give up immediately: the
-	 * constant-argument rewrite below does not need them, so the answer is
-	 * remembered and acted on only where it matters.  It is called
-	 * unconditionally, before we even know whether this Aggref is one of
-	 * ours, because it is what resolves pps_sum_numeric_oid/
-	 * pps_avg_numeric_oid in the first place -- there is nothing to compare
-	 * agg->aggfnoid against otherwise.  The lookups are cached, so on every
-	 * call after the first in a backend this is two flag checks.
-	 */
-	bounded_ok = pps_load_oids();
+	if (!pps_bounded_numeric_agg)
+		return NULL;
 
-	/*
-	 * Is this even one of ours?  Every Aggref in every query reaches this
-	 * hook, so this comparison, not a catalog attachment, is what used to be
-	 * "did the DBA point prosupport at us" -- and unlike that, declining a
-	 * count(*) or a max(text) here is the overwhelmingly common case, not a
-	 * misconfiguration, so there is nothing to log about it.
-	 *
-	 * There is no core-level substitution running ahead of this one -- on a
-	 * server built with only the agg_simplify_hook patch (the pre-PG19
-	 * target this extension is for), a plain sum(c) with c declared
-	 * numeric(p,s) reaches this function exactly the same way sum(a + b) or
-	 * avg(c) does, and pps_derive_bounds() below proves the plain-typmod
-	 * case (its first branch) the same way it proves an arithmetic
-	 * expression's.
-	 */
+	pps_load_oids();
+
+	/* In this specific prosupport we can process only SUM or AVG. */
 	if (agg->aggfnoid == pps_sum_numeric_oid)
 		newfn = pps_bounded_sum_oid;
 	else if (agg->aggfnoid == pps_avg_numeric_oid)
@@ -654,50 +609,12 @@ pps_simplify_bounded_numeric_agg(struct PlannerInfo *root, Aggref *agg)
 	else
 		return NULL;
 
-	/*
-	 * The off switch for this rewrite alone -- constagg.c's constant fold has
-	 * already had its own turn by the time pps_agg_simplify_hook() calls this
-	 * function; see its comment.
-	 */
-	if (!pps_bounded_numeric_agg)
-	{
-		pps_decline(agg->aggfnoid, "pg_prosupport.bounded_numeric_agg is off");
-		return NULL;
-	}
-
-	/* everything below replaces the aggregate with one of ours */
-	if (!bounded_ok)
-		return NULL;
-
-	/*
-	 * The conditions under which we fire.  Each one declines rather than tries
-	 * to work around the problem: the price of a mistake here is a silently
-	 * wrong sum, not a slow query.
-	 *
-	 * aggsplit is not tested: agg_simplify_hook is called from
-	 * eval_const_expressions_mutator() during preprocessing, before the
-	 * planner splits the aggregate, so it is always AGGSPLIT_SIMPLE here.
-	 * Partial aggregation is in fact supported -- through combinefunc -- and
-	 * a test for it would mislead the reader.
-	 */
 	Assert(agg->aggsplit == AGGSPLIT_SIMPLE);
+	Assert(list_length(agg->args) == 1);
 
-	if (agg->aggdistinct != NIL || agg->aggorder != NIL ||
-		agg->aggfilter != NULL || agg->aggvariadic ||
-		agg->agglevelsup != 0)
-	{
-		pps_decline(agg->aggfnoid,
-					"DISTINCT, ORDER BY, FILTER, VARIADIC or an outer "
-					"reference is present");
+	/* Just not yet checked */
+	if (agg->aggvariadic || agg->agglevelsup != 0)
 		return NULL;
-	}
-
-	if (list_length(agg->args) != 1)
-	{
-		pps_decline(agg->aggfnoid,
-					"aggregate does not have exactly one argument");
-		return NULL;
-	}
 
 	tle = (TargetEntry *) linitial(agg->args);
 
@@ -727,19 +644,14 @@ pps_simplify_bounded_numeric_agg(struct PlannerInfo *root, Aggref *agg)
 	}
 
 	/*
-	 * pps_derive_bounds() enforces the range as it goes -- at p <= 28 the
+	 * pps_derive_bounds() enforces the range as it goes - at p <= 28 the
 	 * mantissa is below 10^28 ~ 2^93 and the int128 accumulator holds ~1.7e10
-	 * addends -- so there is nothing left to check here.  A negative scale
+	 * addends - so there is nothing left to check here.  A negative scale
 	 * (possible since PG15) is rejected there too, or a -2 would end up in
 	 * 10^s and break everything quietly.
 	 */
 	if (!pps_derive_bounds((Node *) tle->expr, 0, &p, &s))
-	{
-		pps_decline(agg->aggfnoid,
-					"could not derive a precision and scale for the "
-					"argument within the supported range");
 		return NULL;
-	}
 
 	Assert(p >= 1 && p <= PPS_MAX_PRECISION && s >= 0 && s <= p);
 
