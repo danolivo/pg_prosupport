@@ -133,6 +133,39 @@ SELECT pps_check(true, 'after a refused detach');
 CREATE TABLE pps_gp (v numeric(18,2));
 INSERT INTO pps_gp SELECT g / 100.0 FROM generate_series(1, 100) g;
 ANALYZE pps_gp;
+--
+-- Before any of that: the rewrite has to work for a user who is not the owner
+-- of anything here.  ExecInitAgg() checks ACL_EXECUTE on aggref->aggfnoid
+-- against the calling user, and the planner substitutes bounded_numeric_sum
+-- behind that user's back, so the REVOKE block in the install script has to
+-- stop short of the aggregates -- while the transition functions, checked
+-- against the aggregate's owner instead, may be and are revoked.  If that
+-- distinction is ever lost, this is where it shows.
+--
+GRANT SELECT ON pps_gp TO regress_pps_plain;
+SET ROLE regress_pps_plain;
+DO $$
+DECLARE
+  r     record;
+  plan  text := '';
+  pg19  boolean := current_setting('server_version_num')::int >= 190000;
+  total numeric;
+BEGIN
+  FOR r IN EXECUTE 'EXPLAIN (costs off, verbose) SELECT sum(v) FROM pps_gp' LOOP
+    plan := plan || r."QUERY PLAN" || E'\n';
+  END LOOP;
+  IF (plan LIKE '%bounded_numeric_sum%') <> pg19 THEN
+    RAISE EXCEPTION 'plan for a non-superuser does not match the branch: %', plan;
+  END IF;
+
+  SELECT sum(v) INTO total FROM pps_gp;		-- must not raise
+  IF total <> 50.50 THEN
+    RAISE EXCEPTION 'a non-superuser summed to % instead of 50.50', total;
+  END IF;
+END
+$$;
+RESET ROLE;
+REVOKE SELECT ON pps_gp FROM regress_pps_plain;
 SET plan_cache_mode = force_generic_plan;
 PREPARE gp(numeric) AS SELECT sum(v) FROM pps_gp WHERE v > $1;
 EXECUTE gp(0);

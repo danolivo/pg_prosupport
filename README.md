@@ -146,9 +146,31 @@ no ownership of it, so `DROP EXTENSION` leaves it behind, empty. A later
 away — if a future release starts dropping the schema, that test is where it
 shows up.
 
-The install script grants `USAGE` on that schema to `PUBLIC`. That is not
-cosmetic: the rewrite resolves the substitute aggregate by name, and that
-lookup checks `ACL_USAGE` against the calling user.
+The install script ends with `GRANT USAGE ON SCHEMA prosupport TO PUBLIC` and
+then revokes `EXECUTE` from `PUBLIC` on every function it created. Both halves
+are load-bearing, and the line between them is not where you would guess:
+
+- The **schema** must be usable by everyone. `LookupFuncName()`, which is how
+  the rewrite finds the substitute aggregate, goes through
+  `LookupExplicitNamespace()`, and that checks `ACL_USAGE` against the *calling*
+  user. Without the grant an ordinary user's `sum(v)` fails in the planner with
+  `permission denied for schema prosupport` — not a lost optimisation, a broken
+  query.
+- The **aggregates** must stay executable by everyone, for the same shape of
+  reason one level down: `ExecInitAgg()` checks `ACL_EXECUTE` on
+  `aggref->aggfnoid` against the calling user, and the planner put
+  `bounded_numeric_sum` there behind that user's back. Revoke it and the same
+  query fails with `permission denied for aggregate bounded_numeric_sum` — a
+  refusal naming an object the user never wrote.
+- Everything else is revoked. The transition, combine, serialize and final
+  functions are checked against the aggregate's *owner*, not the caller, so
+  taking `EXECUTE` away from `PUBLIC` costs a rewritten query nothing; and they
+  all take `internal`, so nobody could have called them by hand regardless.
+  `pps_set_support()` and its two wrappers are the ones where the revoke
+  matters.
+
+`install.sql` runs a plain, unprivileged role through a rewritten `sum()` to
+keep that line where it is.
 
 The attachment is per database, like the extension, and it is not carried by
 `pg_dump` (catalog rows of `pg_catalog` objects never are). After a dump and

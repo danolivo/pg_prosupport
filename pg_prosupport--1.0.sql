@@ -201,9 +201,38 @@ RETURNS void
 -- left callable is exactly what the planner needs to be callable.
 GRANT USAGE ON SCHEMA @extschema@ TO PUBLIC;
 
+-- Nothing in this extension is meant to be called by hand, so take EXECUTE
+-- away from PUBLIC everywhere it can be taken away safely.
+--
+-- The three above are the ones where it matters: they write pg_proc.  The rest
+-- of this list is belt and braces -- every one of those functions takes or
+-- returns internal, so no caller could construct an argument for it anyway --
+-- but a REVOKE costs nothing and says out loud that they are not an API.
+--
+-- The aggregates are NOT in the list, and must not be.  ExecInitAgg() checks
+-- ACL_EXECUTE on aggref->aggfnoid against the *calling* user (nodeAgg.c), and
+-- the planner puts bounded_numeric_sum into the plan behind that user's back.
+-- Revoking it would make a plain "SELECT sum(v) FROM t" fail for ordinary
+-- users with "permission denied for aggregate bounded_numeric_sum" -- a
+-- refusal naming an object they never wrote and cannot find.  A rewrite has to
+-- be invisible, which means the thing it rewrites to has to be callable.
+--
+-- Their transition functions are a different matter: nodeAgg.c checks those
+-- against the aggregate's *owner*, not the caller, so revoking them changes
+-- nothing for a rewritten query.  install.sql checks exactly that, as an
+-- ordinary user.
 REVOKE ALL ON FUNCTION pps_set_support(boolean) FROM PUBLIC;
 REVOKE ALL ON FUNCTION pps_attach_support() FROM PUBLIC;
 REVOKE ALL ON FUNCTION pps_detach_support() FROM PUBLIC;
+REVOKE ALL ON FUNCTION pps_agg_support(internal) FROM PUBLIC;
+REVOKE ALL ON FUNCTION pps_bounded_accum(internal, numeric, int4) FROM PUBLIC;
+REVOKE ALL ON FUNCTION pps_bounded_accum_mul(internal, numeric, numeric, int4, int4)
+  FROM PUBLIC;
+REVOKE ALL ON FUNCTION pps_bounded_combine(internal, internal) FROM PUBLIC;
+REVOKE ALL ON FUNCTION pps_bounded_serialize(internal) FROM PUBLIC;
+REVOKE ALL ON FUNCTION pps_bounded_deserialize(bytea, internal) FROM PUBLIC;
+REVOKE ALL ON FUNCTION pps_bounded_sum_final(internal) FROM PUBLIC;
+REVOKE ALL ON FUNCTION pps_bounded_avg_final(internal) FROM PUBLIC;
 
 -- Two aggregates covering 1 <= p <= 28, differing only in the final function,
 -- exactly as core shares numeric_avg_accum between sum() and avg().  They are
