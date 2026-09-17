@@ -217,7 +217,20 @@ typedef struct NasAggState
 	int64		pInfcount;
 	int64		nInfcount;
 	int32		scale;			/* the declared scale, 0..28 */
-} NasAggState;
+
+	/*
+	 * The two factor scales, for the folded-product aggregates only; zero and
+	 * unused in a plain sum/avg state.  They are held here rather than read
+	 * from the call's arguments on every row, so that the argument is examined
+	 * exactly once, when the state is built -- see pps_bounded_accum_mul().
+	 *
+	 * int16 rather than int32 because they fit the padding the struct already
+	 * had after "scale"; the StaticAssertDecl below is what notices if that
+	 * ever stops being true.
+	 */
+	int16		scale1;
+	int16		scale2;
+} BoundedAggState;
 
 /*
  * sspace in pg_prosupport--1.0.sql is declared as 64, which is the
@@ -232,7 +245,7 @@ typedef struct NasAggState
  * that is not a false alarm but exactly the case where sspace needs
  * recomputing.
  */
-StaticAssertDecl(sizeof(NasAggState) == 56,
+StaticAssertDecl(sizeof(BoundedAggState) == 56,
 				 "NasAggState changed size; recompute sspace in "
 				 "pg_prosupport--1.0.sql");
 
@@ -643,16 +656,16 @@ PG_FUNCTION_INFO_V1(pps_bounded_avg_final);
  * thrown part way through a group there is nobody left to free it by hand --
  * resetting the context does that reliably.
  */
-static NasAggState *
+static BoundedAggState *
 pps_make_state(MemoryContext aggcontext, int32 scale)
 {
 	MemoryContext oldcontext;
-	NasAggState *st;
+	BoundedAggState *st;
 
 	Assert(scale >= 0 && scale <= PPS_MAX_PRECISION);
 
 	oldcontext = MemoryContextSwitchTo(aggcontext);
-	st = (NasAggState *) palloc0(sizeof(NasAggState));
+	st = (BoundedAggState *) palloc0(sizeof(BoundedAggState));
 	MemoryContextSwitchTo(oldcontext);
 
 	st->scale = scale;
@@ -713,18 +726,22 @@ pps_check_addends(int64 have, int64 adding)
 Datum
 pps_bounded_accum(PG_FUNCTION_ARGS)
 {
-	NasAggState *st;
-	MemoryContext aggcontext;
-	struct varlena *arg;
-	struct varlena *detoasted;
-	union NumericChoice *c;
+	BoundedAggState		   *state;
+	MemoryContext			aggcontext;
+	struct varlena		   *arg;
+	struct varlena		   *detoasted;
+	union NumericChoice	   *c;
 
 	if (!AggCheckCallContext(fcinfo, &aggcontext))
 		elog(ERROR, "pps_bounded_accum called in non-aggregate context");
 
+	/*
+	 * First call - initialize the state and check that teh aggregate parameters
+	 * set in the correct values.
+	 */
 	if (PG_ARGISNULL(0))
 	{
-		int32		scale;
+		int32	scale;
 
 		if (PG_ARGISNULL(2))
 			ereport(ERROR,
@@ -740,13 +757,13 @@ pps_bounded_accum(PG_FUNCTION_ARGS)
 					 errdetail("The scale must be between 0 and %d.",
 							   PPS_MAX_PRECISION)));
 
-		st = pps_make_state(aggcontext, scale);
+		state = pps_make_state(aggcontext, scale);
 	}
 	else
-		st = (NasAggState *) PG_GETARG_POINTER(0);
+		state = (BoundedAggState *) PG_GETARG_POINTER(0);
 
 	if (PG_ARGISNULL(1))
-		PG_RETURN_POINTER(st);
+		PG_RETURN_POINTER(state);
 
 	arg = (struct varlena *) PG_GETARG_POINTER(1);
 	detoasted = pg_detoast_datum_packed(arg);
@@ -760,11 +777,11 @@ pps_bounded_accum(PG_FUNCTION_ARGS)
 	if (unlikely(PPS_IS_SPECIAL(c)))
 	{
 		if (PPS_IS_NAN(c))
-			st->NaNcount++;
+			state->NaNcount++;
 		else if (PPS_IS_PINF(c))
-			st->pInfcount++;
+			state->pInfcount++;
 		else if (PPS_IS_NINF(c))
-			st->nInfcount++;
+			state->nInfcount++;
 		else
 			elog(ERROR, "unrecognised numeric special value: 0x%04X",
 				 c->n_header);
@@ -782,20 +799,20 @@ pps_bounded_accum(PG_FUNCTION_ARGS)
 		 * itself is caught here, before the addition rather than after it; see
 		 * PPS_MAX_ADDENDS for why it is worth testing at all.
 		 */
-		pps_check_addends(st->N, 1);
+		pps_check_addends(state->N, 1);
 
-		if (likely(pps_get_bounded_int128(c, datalen, st->scale, &m)))
-			pps_int128_add_int128(&st->sumX, m);
+		if (likely(pps_get_bounded_int128(c, datalen, state->scale, &m)))
+			pps_int128_add_int128(&state->sumX, m);
 		else
 			ereport(ERROR,
 					(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
 					 errmsg("value does not fit the declared numeric scale %d",
-							st->scale),
+							state->scale),
 					 errdetail("The aggregate was specialised on the argument's "
 							   "declared type; a row source supplied a value "
 							   "outside that declaration.")));
 
-		st->N++;
+		state->N++;
 	}
 
 	/*
@@ -807,7 +824,7 @@ pps_bounded_accum(PG_FUNCTION_ARGS)
 	if (detoasted != arg)
 		pfree(detoasted);
 
-	PG_RETURN_POINTER(st);
+	PG_RETURN_POINTER(state);
 }
 
 /*
@@ -915,7 +932,7 @@ pps_mul_special(union NumericChoice *ca, int la,
 Datum
 pps_bounded_accum_mul(PG_FUNCTION_ARGS)
 {
-	NasAggState *st;
+	BoundedAggState *st;
 	MemoryContext aggcontext;
 	struct varlena *arga;
 	struct varlena *argb;
@@ -962,9 +979,11 @@ pps_bounded_accum_mul(PG_FUNCTION_ARGS)
 							   PPS_MAX_PRECISION, PPS_MAX_PRECISION)));
 
 		st = pps_make_state(aggcontext, s1 + s2);
+		st->scale1 = (int16) s1;
+		st->scale2 = (int16) s2;
 	}
 	else
-		st = (NasAggState *) PG_GETARG_POINTER(0);
+		st = (BoundedAggState *) PG_GETARG_POINTER(0);
 
 	/* a NULL on either side makes the product NULL, which sum() skips */
 	if (PG_ARGISNULL(1) || PG_ARGISNULL(2))
@@ -995,15 +1014,27 @@ pps_bounded_accum_mul(PG_FUNCTION_ARGS)
 	}
 
 	/*
+	 * The scales come from the state, not from arguments 3 and 4 of this call.
+	 * For a plan built by the support function the two are the same thing --
+	 * both are the Const it planted -- but a hand-written call is free to vary
+	 * them per row, and then reading the arguments here would be wrong twice
+	 * over: a NULL on a later row makes PG_GETARG_INT32() return the contents
+	 * of a datum that was never set, and a non-NULL one would extract the
+	 * mantissa at a scale the accumulated sum is not kept at.  Either way the
+	 * sum comes out wrong with nothing to show for it.  Taking the scales from
+	 * the state makes the aggregate honour the first row and ignore the rest,
+	 * which is what the plain transition function has always done with its own
+	 * scale argument.
+	 *
 	 * Each mantissa has to come out in an int64.  pps_get_bounded_int128() only
 	 * promises PPS_MAX_PRECISION digits, so the narrower bound is checked here
 	 * rather than assumed: the support function does guarantee it, but a
 	 * direct call to this aggregate does not, and silently truncating a
 	 * mantissa would produce a wrong sum with nothing to show for it.
 	 */
-	if (unlikely(!pps_get_bounded_int128(ca, la, PG_GETARG_INT32(3), &wide) ||
+	if (unlikely(!pps_get_bounded_int128(ca, la, st->scale1, &wide) ||
 				 !pps_int128_fits_int64(wide, &ma) ||
-				 !pps_get_bounded_int128(cb, lb, PG_GETARG_INT32(4), &wide) ||
+				 !pps_get_bounded_int128(cb, lb, st->scale2, &wide) ||
 				 !pps_int128_fits_int64(wide, &mb)))
 		ereport(ERROR,
 				(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
@@ -1043,15 +1074,15 @@ done:
 Datum
 pps_bounded_combine(PG_FUNCTION_ARGS)
 {
-	NasAggState *st1;
-	NasAggState *st2;
+	BoundedAggState *st1;
+	BoundedAggState *st2;
 	MemoryContext aggcontext;
 
 	if (!AggCheckCallContext(fcinfo, &aggcontext))
 		elog(ERROR, "pps_bounded_combine called in non-aggregate context");
 
-	st1 = PG_ARGISNULL(0) ? NULL : (NasAggState *) PG_GETARG_POINTER(0);
-	st2 = PG_ARGISNULL(1) ? NULL : (NasAggState *) PG_GETARG_POINTER(1);
+	st1 = PG_ARGISNULL(0) ? NULL : (BoundedAggState *) PG_GETARG_POINTER(0);
+	st2 = PG_ARGISNULL(1) ? NULL : (BoundedAggState *) PG_GETARG_POINTER(1);
 
 	if (st2 == NULL)
 	{
@@ -1063,6 +1094,8 @@ pps_bounded_combine(PG_FUNCTION_ARGS)
 	if (st1 == NULL)
 	{
 		st1 = pps_make_state(aggcontext, st2->scale);
+		st1->scale1 = st2->scale1;
+		st1->scale2 = st2->scale2;
 		st1->sumX = st2->sumX;
 		st1->N = st2->N;
 		st1->NaNcount = st2->NaNcount;
@@ -1112,17 +1145,19 @@ pps_bounded_combine(PG_FUNCTION_ARGS)
 Datum
 pps_bounded_serialize(PG_FUNCTION_ARGS)
 {
-	NasAggState *st;
+	BoundedAggState *st;
 	StringInfoData buf;
 	bytea	   *result;
 
 	if (!AggCheckCallContext(fcinfo, NULL))
 		elog(ERROR, "pps_bounded_serialize called in non-aggregate context");
 
-	st = (NasAggState *) PG_GETARG_POINTER(0);
+	st = (BoundedAggState *) PG_GETARG_POINTER(0);
 
 	pq_begintypsend(&buf);
 	pq_sendint32(&buf, st->scale);
+	pq_sendint16(&buf, st->scale1);
+	pq_sendint16(&buf, st->scale2);
 	pq_sendint64(&buf, st->N);
 	pq_sendint64(&buf, st->NaNcount);
 	pq_sendint64(&buf, st->pInfcount);
@@ -1138,10 +1173,12 @@ Datum
 pps_bounded_deserialize(PG_FUNCTION_ARGS)
 {
 	bytea	   *sstate;
-	NasAggState *st;
+	BoundedAggState *st;
 	MemoryContext aggcontext;
 	StringInfoData buf;
 	int32		scale;
+	int32		scale1;
+	int32		scale2;
 	int64		hi;
 	uint64		lo;
 
@@ -1162,7 +1199,27 @@ pps_bounded_deserialize(PG_FUNCTION_ARGS)
 	if (scale < 0 || scale > PPS_MAX_PRECISION)
 		elog(ERROR, "unrecognised scale %d in serialised aggregate state", scale);
 
+	/*
+	 * The factor scales are carried across even though nothing on the leader
+	 * side looks at them: a deserialised state only ever reaches
+	 * pps_bounded_combine() and the final functions, never a transition
+	 * function.  Shipping them anyway keeps every state that exists a complete
+	 * one, rather than leaving a struct whose last two fields are meaningful in
+	 * a worker and silently zero in the leader -- and it pays for itself here,
+	 * as an integrity check on the message.
+	 */
+	/* cast, because pq_getmsgint() zero-extends and we want a signed value */
+	scale1 = (int16) pq_getmsgint(&buf, 2);
+	scale2 = (int16) pq_getmsgint(&buf, 2);
+	if (scale1 < 0 || scale2 < 0 ||
+		scale1 > PPS_MAX_PRECISION || scale2 > PPS_MAX_PRECISION ||
+		(scale1 + scale2 != 0 && scale1 + scale2 != scale))
+		elog(ERROR, "mismatched scales %d and %d against %d in serialised aggregate state",
+			 scale1, scale2, scale);
+
 	st = pps_make_state(aggcontext, scale);
+	st->scale1 = (int16) scale1;
+	st->scale2 = (int16) scale2;
 
 	st->N = pq_getmsgint64(&buf);
 	st->NaNcount = pq_getmsgint64(&buf);
@@ -1286,7 +1343,7 @@ typedef enum NasFinalCase
  * *result is only set for PPS_FINAL_SPECIAL.
  */
 static NasFinalCase
-pps_final_preamble(NasAggState *st, Datum *result)
+pps_final_preamble(BoundedAggState *st, Datum *result)
 {
 	if (st == NULL || PPS_TOTAL_COUNT(st) == 0)
 		return PPS_FINAL_NULL;
@@ -1327,7 +1384,7 @@ pps_final_preamble(NasAggState *st, Datum *result)
  * changes how many digits show up in the output.
  */
 static Numeric
-pps_sum_numeric(NasAggState *st)
+pps_sum_numeric(BoundedAggState *st)
 {
 	int64		narrow;
 
@@ -1349,13 +1406,13 @@ pps_sum_numeric(NasAggState *st)
 Datum
 pps_bounded_sum_final(PG_FUNCTION_ARGS)
 {
-	NasAggState *st;
+	BoundedAggState *st;
 	Datum		result = (Datum) 0;
 
 	if (!AggCheckCallContext(fcinfo, NULL))
 		elog(ERROR, "pps_bounded_sum_final called in non-aggregate context");
 
-	st = PG_ARGISNULL(0) ? NULL : (NasAggState *) PG_GETARG_POINTER(0);
+	st = PG_ARGISNULL(0) ? NULL : (BoundedAggState *) PG_GETARG_POINTER(0);
 
 	switch (pps_final_preamble(st, &result))
 	{
@@ -1388,7 +1445,7 @@ pps_bounded_sum_final(PG_FUNCTION_ARGS)
 Datum
 pps_bounded_avg_final(PG_FUNCTION_ARGS)
 {
-	NasAggState *st;
+	BoundedAggState *st;
 	Datum		result = (Datum) 0;
 	Datum		sum_datum;
 	Datum		n_datum;
@@ -1396,7 +1453,7 @@ pps_bounded_avg_final(PG_FUNCTION_ARGS)
 	if (!AggCheckCallContext(fcinfo, NULL))
 		elog(ERROR, "pps_bounded_avg_final called in non-aggregate context");
 
-	st = PG_ARGISNULL(0) ? NULL : (NasAggState *) PG_GETARG_POINTER(0);
+	st = PG_ARGISNULL(0) ? NULL : (BoundedAggState *) PG_GETARG_POINTER(0);
 
 	switch (pps_final_preamble(st, &result))
 	{
