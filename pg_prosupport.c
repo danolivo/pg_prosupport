@@ -53,6 +53,13 @@
 #include "utils/inval.h"
 #include "utils/lsyscache.h"
 #include "utils/plancache.h"
+/*
+ * For PROCOID.  Do not drop this because the file builds without it: on 19 and
+ * later utils/inval.h reaches catalog/syscache_ids.h on its own, and on 18 it
+ * does not, so leaving it to the transitive include breaks the older branch
+ * only.
+ */
+#include "utils/syscache.h"
 
 #include "pg_prosupport.h"
 
