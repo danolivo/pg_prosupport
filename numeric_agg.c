@@ -727,11 +727,18 @@ pps_bounded_accum(PG_FUNCTION_ARGS)
 		int32		scale;
 
 		if (PG_ARGISNULL(2))
-			elog(ERROR, "scale argument of pps_bounded_accum must not be null");
+			ereport(ERROR,
+					(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+					 errmsg("scale argument of a specialised numeric aggregate must not be null")));
 
 		scale = PG_GETARG_INT32(2);
 		if (scale < 0 || scale > PPS_MAX_PRECISION)
-			elog(ERROR, "unrecognised scale %d for pps_bounded_accum", scale);
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("scale %d is out of range for a specialised numeric aggregate",
+							scale),
+					 errdetail("The scale must be between 0 and %d.",
+							   PPS_MAX_PRECISION)));
 
 		st = pps_make_state(aggcontext, scale);
 	}
@@ -930,14 +937,29 @@ pps_bounded_accum_mul(PG_FUNCTION_ARGS)
 		int32		s1;
 		int32		s2;
 
+		/* user-reachable through the aggregate; see pps_bounded_accum() */
 		if (PG_ARGISNULL(3) || PG_ARGISNULL(4))
-			elog(ERROR, "scale arguments of pps_bounded_accum_mul must not be null");
+			ereport(ERROR,
+					(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+					 errmsg("scale arguments of a specialised numeric aggregate must not be null")));
 
 		s1 = PG_GETARG_INT32(3);
 		s2 = PG_GETARG_INT32(4);
-		if (s1 < 0 || s2 < 0 || s1 + s2 > PPS_MAX_PRECISION)
-			elog(ERROR, "unrecognised scales %d and %d for pps_bounded_accum_mul",
-				 s1, s2);
+
+		/*
+		 * Here is some shielding is added to survive the case, when s1=s2=2^30
+		 * that passes the two non-negativity tests and then overflows
+		 * the addition.
+		 */
+		if (s1 < 0 || s2 < 0 ||
+			s1 > PPS_MAX_PRECISION || s2 > PPS_MAX_PRECISION ||
+			s1 + s2 > PPS_MAX_PRECISION)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("scales %d and %d are out of range for a specialised numeric aggregate",
+							s1, s2),
+					 errdetail("Each scale must be between 0 and %d, and their sum must not exceed %d.",
+							   PPS_MAX_PRECISION, PPS_MAX_PRECISION)));
 
 		st = pps_make_state(aggcontext, s1 + s2);
 	}

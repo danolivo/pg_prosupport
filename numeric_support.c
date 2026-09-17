@@ -63,14 +63,6 @@
 #error "pg_prosupport requires PostgreSQL 15 or later (numeric typmod encoding)"
 #endif
 
-/*
- * The off switch for this rewrite alone (GUC pg_prosupport.bounded_numeric_agg,
- * defined in pg_prosupport.c's _PG_init() so that both this and
- * constagg.c's pps_fold_const_sum flush the plan cache on the same terms).
- * On by default: narrowing an accumulator is never a change of plan shape a
- * DBA needs to opt into, only ever a change of which bounded_numeric_*
- * function runs the accumulation.
- */
 bool		pps_bounded_numeric_agg = true;
 
 /* the mantissa fits in int128 and the accumulator holds ~1.7e10 addends */
