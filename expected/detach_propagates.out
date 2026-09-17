@@ -1,0 +1,87 @@
+Parsed test spec with 2 sessions
+
+starting permutation: s2_create s1_generic s1_prepare s1_run s1_rewritten s2_detach s1_stock s1_run s2_drop s1_stock s1_run s2_create s1_rewritten s1_forget s1_prepare s1_run s1_rewritten s2_detach s1_stock s2_drop
+step s2_create: CREATE EXTENSION pg_prosupport;
+step s1_generic: SET plan_cache_mode = force_generic_plan;
+step s1_prepare: PREPARE gp(numeric) AS SELECT sum(v) FROM pps_t WHERE v > $1;
+step s1_run: EXECUTE gp(0);
+  sum
+-----
+50.50
+(1 row)
+
+step s1_rewritten: SELECT pps_plan_ok(true) AS plan;
+plan
+----
+ok  
+(1 row)
+
+step s2_detach: 
+    DO $$
+    BEGIN
+      IF current_setting('server_version_num')::int >= 190000 THEN
+        PERFORM prosupport.pps_detach_support();
+      END IF;
+    END $$;
+
+step s1_stock: SELECT pps_plan_ok(false) AS plan;
+plan
+----
+ok  
+(1 row)
+
+step s1_run: EXECUTE gp(0);
+  sum
+-----
+50.50
+(1 row)
+
+step s2_drop: DROP EXTENSION pg_prosupport;
+step s1_stock: SELECT pps_plan_ok(false) AS plan;
+plan
+----
+ok  
+(1 row)
+
+step s1_run: EXECUTE gp(0);
+  sum
+-----
+50.50
+(1 row)
+
+step s2_create: CREATE EXTENSION pg_prosupport;
+step s1_rewritten: SELECT pps_plan_ok(true) AS plan;
+plan
+----
+ok  
+(1 row)
+
+step s1_forget: DEALLOCATE gp;
+step s1_prepare: PREPARE gp(numeric) AS SELECT sum(v) FROM pps_t WHERE v > $1;
+step s1_run: EXECUTE gp(0);
+  sum
+-----
+50.50
+(1 row)
+
+step s1_rewritten: SELECT pps_plan_ok(true) AS plan;
+plan
+----
+ok  
+(1 row)
+
+step s2_detach: 
+    DO $$
+    BEGIN
+      IF current_setting('server_version_num')::int >= 190000 THEN
+        PERFORM prosupport.pps_detach_support();
+      END IF;
+    END $$;
+
+step s1_stock: SELECT pps_plan_ok(false) AS plan;
+plan
+----
+ok  
+(1 row)
+
+step s2_drop: DROP EXTENSION pg_prosupport;

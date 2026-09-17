@@ -16,6 +16,11 @@ DATA = pg_prosupport--1.0.sql
 PGFILEDESC = "pg_prosupport - plan-time aggregate rewrites through the prosupport machinery"
 
 REGRESS = install numeric_agg const_agg
+
+# The one thing sql/ cannot reach: whether a detach in one backend invalidates
+# a generic plan held by another.  See specs/detach_propagates.spec.
+ISOLATION = detach_propagates
+
 ifdef USE_PGXS
 PG_CONFIG ?= pg_config
 PGXS := $(shell $(PG_CONFIG) --pgxs)

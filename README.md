@@ -465,9 +465,27 @@ rather than discovering after the fact, so it defaults to off.
 SELECT pps_detach_support();
 ```
 
-The next plan uses the stock `sum()`/`avg()` again; the call flushes the plan
-cache in the session that runs it, and other backends see the `pg_proc`
-change through the usual invalidation. `pps_attach_support()` puts it back.
+The next plan uses the stock `sum()`/`avg()` again, in **every** backend, not
+just the one that ran the detach — which took some doing, and is worth knowing
+about if you ever write something similar.
+
+Writing `sum(numeric)`'s `prosupport` does send a cluster-wide invalidation for
+that `pg_proc` row, but no cached plan is subscribed to it:
+`record_plan_function_dependency()` in `setrefs.c` skips every OID below
+`FirstUnpinnedObjectId`, so a plan never records a dependency on a built-in
+aggregate. A plan that carries the rewrite names `bounded_numeric_sum`
+instead — an ordinary user-space OID, and *that* one is in the plan's
+`invalItems`. So `pps_detach_support()` finishes with a no-op
+`UPDATE pg_proc SET proname = proname` over the four `bounded_numeric_*`
+aggregates, purely for the invalidation it emits. Without it a pooled
+connection goes on using the rewrite indefinitely after a detach;
+`specs/detach_propagates.spec` is the two-session test that says so.
+
+The reverse does not work and is not attempted: a plan holding the stock
+`sum(numeric)` has no dependency to invalidate, so `pps_attach_support()` only
+reaches the session that runs it. That is what it needs to be — it runs from
+the install script, where nothing has been planned yet, and later sessions plan
+with the attachment already in place.
 
 **Entirely, on 18** — remove `pg_prosupport` from `shared_preload_libraries`
 (or `session_preload_libraries`) and restart/reconnect; a session that loaded

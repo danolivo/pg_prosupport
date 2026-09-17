@@ -119,6 +119,7 @@ SELECT pps_check(true, 'after a refused detach');
 CREATE TABLE pps_gp (v numeric(18,2));
 INSERT INTO pps_gp SELECT g / 100.0 FROM generate_series(1, 100) g;
 ANALYZE pps_gp;
+
 --
 -- Before any of that: the rewrite has to work for a user who is not the owner
 -- of anything here.  ExecInitAgg() checks ACL_EXECUTE on aggref->aggfnoid
@@ -152,7 +153,6 @@ END
 $$;
 RESET ROLE;
 REVOKE SELECT ON pps_gp FROM regress_pps_plain;
-
 
 SET plan_cache_mode = force_generic_plan;
 PREPARE gp(numeric) AS SELECT sum(v) FROM pps_gp WHERE v > $1;

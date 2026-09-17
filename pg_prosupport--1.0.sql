@@ -87,6 +87,7 @@ DECLARE
   aggfn   oid;
   oldsup  oid;
   newsup  oid;
+  changed boolean := false;
 BEGIN
   -- Not the security boundary -- that is the REVOKE at the foot of this file,
   -- plus pg_proc's own ACL, which a SECURITY INVOKER function cannot get past
@@ -140,6 +141,7 @@ BEGIN
     END IF;
 
     UPDATE pg_proc SET prosupport = newsup WHERE oid = aggfn;
+    changed := true;
 
     IF oldsup <> 0 THEN
       DELETE FROM pg_depend
@@ -165,9 +167,36 @@ BEGIN
     END IF;
   END LOOP;
 
-  -- A generic plan built before this call has the old shape in it and will not
-  -- replan by itself; on detach that means the rewrite outlives its removal.
-  -- Backend-local, exactly like the ResetPlanCache() it replaces.
+  -- Reaching every backend that holds a rewritten plan, not just this one.
+  --
+  -- The UPDATE above does send a cluster-wide invalidation for sum(numeric)'s
+  -- pg_proc row, but nothing is listening: record_plan_function_dependency()
+  -- in setrefs.c skips every OID below FirstUnpinnedObjectId, so no plan ever
+  -- records a dependency on a built-in aggregate.  A plan that carries the
+  -- rewrite names bounded_numeric_sum instead -- an ordinary user-space OID,
+  -- and that one *is* in the plan's invalItems.  So writing its pg_proc row
+  -- is what the other backends are actually subscribed to.
+  --
+  -- Hence the no-op UPDATE below.  It exists purely for its side effect: a
+  -- PROCOID invalidation whose hash matches what those plans recorded, which
+  -- makes PlanCacheFuncCallback() drop them everywhere.
+  --
+  -- Only on the detach side: a plan holding the stock sum() has no invalItem
+  -- for it, so there is no row whose invalidation would reach that plan.
+  -- "changed" keeps a detach that had nothing to detach from writing four
+  -- dead tuples for nothing.
+  IF NOT attach AND changed THEN
+    UPDATE pg_proc SET proname = proname
+     WHERE oid = ANY (ARRAY[
+             '@extschema@.bounded_numeric_sum(numeric,int4)'::regprocedure,
+             '@extschema@.bounded_numeric_avg(numeric,int4)'::regprocedure,
+             '@extschema@.bounded_numeric_sum_mul(numeric,numeric,int4,int4)'::regprocedure,
+             '@extschema@.bounded_numeric_avg_mul(numeric,numeric,int4,int4)'::regprocedure]);
+  END IF;
+
+  -- And this backend's own plans, which the above does not cover on attach and
+  -- which are the ones the caller notices first.  Backend-local, exactly like
+  -- the ResetPlanCache() it replaces.
   EXECUTE 'DISCARD PLANS';
 END
 $body$;
