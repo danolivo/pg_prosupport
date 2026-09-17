@@ -15,8 +15,7 @@ EXTENSION = pg_prosupport
 DATA = pg_prosupport--1.0.sql
 PGFILEDESC = "pg_prosupport - plan-time aggregate rewrites through the prosupport machinery"
 
-REGRESS = numeric_agg const_agg
-
+REGRESS = install numeric_agg const_agg
 ifdef USE_PGXS
 PG_CONFIG ?= pg_config
 PGXS := $(shell $(PG_CONFIG) --pgxs)

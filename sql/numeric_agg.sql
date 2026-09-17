@@ -1,5 +1,10 @@
 CREATE EXTENSION pg_prosupport;
 
+-- The extension is not relocatable and lives in a schema of its own, which is
+-- not on the default search_path; put it there so that EXPLAIN prints the
+-- substituted aggregates unqualified and the tables stay in public.
+SET search_path = public, prosupport;
+
 -- The substitution happens through agg_simplify_hook, a global planner hook
 -- that _PG_init() installs when the library is loaded -- see the README.
 -- CREATE EXTENSION creates the catalog objects but does not by itself load

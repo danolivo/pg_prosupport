@@ -126,6 +126,30 @@ demand and `dlopen()`s the library itself. Superuser only, because the
 attachment writes to `pg_proc` — and because it does, `DROP EXTENSION` is no
 longer unconditional; see Removal.
 
+The extension is **not relocatable** and installs into a schema of its own,
+`prosupport`, which `CREATE EXTENSION` creates for you;
+`CREATE EXTENSION ... SCHEMA something_else` and
+`ALTER EXTENSION ... SET SCHEMA` are both errors. That is deliberate.
+`pps_attach_support()` and `pps_detach_support()` are plpgsql, and a plpgsql
+body has to name `pps_agg_support()` in full: `@extschema@` is substituted
+once, when the install script runs, so a later move of the extension would
+leave those two naming a schema that no longer holds the function — or, worse,
+one that holds a different function of the same name. Forbidding the move is
+what makes the qualified name true for the life of the installation. Nothing
+else needs the schema on `search_path`: the rewrites reach the aggregates by
+OID, not by name. Add it if you want to call `pps_detach_support()` without
+qualifying it.
+
+One wrinkle worth knowing: `CREATE EXTENSION` creates that schema but records
+no ownership of it, so `DROP EXTENSION` leaves it behind, empty. A later
+`CREATE EXTENSION` reuses it. `install.sql` asserts this rather than wishing it
+away — if a future release starts dropping the schema, that test is where it
+shows up.
+
+The install script grants `USAGE` on that schema to `PUBLIC`. That is not
+cosmetic: the rewrite resolves the substitute aggregate by name, and that
+lookup checks `ACL_USAGE` against the calling user.
+
 The attachment is per database, like the extension, and it is not carried by
 `pg_dump` (catalog rows of `pg_catalog` objects never are). After a dump and
 restore the extension is there and the attachment is not, which is what
@@ -441,6 +465,9 @@ On 19 and later, detach first:
 SELECT pps_detach_support();
 DROP EXTENSION pg_prosupport;
 ```
+
+(Qualified, `SELECT prosupport.pps_detach_support();`, unless the
+extension's schema is on your `search_path`.)
 
 The order is not advice, it is enforced. `pps_attach_support()` records a
 `pg_depend` entry from `sum(numeric)` to `pps_agg_support()`, so a `DROP

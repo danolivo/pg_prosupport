@@ -14,10 +14,7 @@
  * used there, and it is the same one core uses to turn count(1) into
  * count(*): pps_agg_support() below is attached to pg_catalog.sum(numeric)
  * and pg_catalog.avg(numeric) by pps_attach_support(), which the install
- * script runs.  Nothing has to be preloaded there -- fmgr dlopen's the
- * library the first time the planner resolves the support function -- but
- * the attachment is a write to pg_proc, so it has its counterpart in
- * pps_detach_support(); see the README.
+ * script runs.
  *
  * PostgreSQL 18 has no such call.  There the rewrites are reached through
  * agg_simplify_hook, a single global planner hook added by the patch in
@@ -49,25 +46,13 @@
  */
 #include "postgres.h"
 
-#include "access/htup_details.h"
-#include "access/table.h"
-#include "access/xact.h"
-#include "catalog/dependency.h"
-#include "catalog/indexing.h"
-#include "catalog/pg_proc.h"
-#include "catalog/pg_type.h"
 #include "fmgr.h"
-#include "miscadmin.h"
-#include "nodes/makefuncs.h"
 #include "nodes/supportnodes.h"
 #include "optimizer/clauses.h"
-#include "parser/parse_func.h"
 #include "utils/guc.h"
 #include "utils/inval.h"
 #include "utils/lsyscache.h"
 #include "utils/plancache.h"
-#include "utils/regproc.h"
-#include "utils/syscache.h"
 
 #include "pg_prosupport.h"
 
@@ -85,14 +70,9 @@ PG_MODULE_MAGIC;
 #define PPS_USE_AGGREF_SUPPORT	0
 #endif
 
-/* the built-in aggregates whose prosupport entry we claim on 19 and later */
-static const char *const pps_target_aggregates[] = {"sum", "avg"};
-
 void		_PG_init(void);
 
 PG_FUNCTION_INFO_V1(pps_agg_support);
-PG_FUNCTION_INFO_V1(pps_attach_support);
-PG_FUNCTION_INFO_V1(pps_detach_support);
 
 #if !PPS_USE_AGGREF_SUPPORT
 /* whatever agg_simplify_hook held before we installed ours */
@@ -149,8 +129,8 @@ pps_simplify_aggref(PlannerInfo *root, Aggref *aggref)
  * never a modified *aggref, or NULL to leave the aggregate alone.
  *
  * On PostgreSQL 18 nothing ever calls this: the request type does not exist
- * and pps_attach_support() refuses to run, so the function is here only so
- * that one install script works on every supported branch.
+ * and pps_set_support() refuses to run, so the function is here only so that
+ * one install script works on every supported branch.
  */
 Datum
 pps_agg_support(PG_FUNCTION_ARGS)
@@ -282,198 +262,6 @@ _PG_init(void)
 
 	/* from here on the assign hooks may touch the plan cache */
 	pps_ready = true;
-}
-
-/*
- * pps_agg_support_oid
- *		The OID of this extension's pps_agg_support(internal), looked up in
- *		the schema the calling function lives in.
- *
- * Taking the schema from the caller rather than from search_path is what
- * makes this survive CREATE EXTENSION ... SCHEMA and ALTER EXTENSION ... SET
- * SCHEMA: attach and detach then always mean *this* installation's support
- * function, never a same-named function that happens to come first in the
- * caller's search_path.
- */
-static Oid
-pps_agg_support_oid(FunctionCallInfo fcinfo)
-{
-	Oid			argtypes[1] = {INTERNALOID};
-	Oid			nspoid = get_func_namespace(fcinfo->flinfo->fn_oid);
-	List	   *funcname;
-
-	funcname = list_make2(makeString(get_namespace_name(nspoid)),
-						  makeString(pstrdup("pps_agg_support")));
-
-	return LookupFuncName(funcname, 1, argtypes, false);
-}
-
-/*
- * pps_set_prosupport
- *		Point aggfnoid's pg_proc.prosupport at supportfn, or clear it when
- *		supportfn is InvalidOid, dependency included.
- *
- * This is ALTER FUNCTION ... SUPPORT in all but name.  It has to be spelled
- * out here because that command refuses an aggregate outright ("%s is an
- * aggregate function", AlterFunction() in functioncmds.c), and an aggregate
- * is exactly what we have to attach to: it is sum(numeric)'s own prosupport
- * entry that simplify_aggref() consults, nobody else's.
- *
- * The pg_depend record is the point of doing this properly rather than with
- * a bare UPDATE from the install script.  Without it, DROP EXTENSION would
- * leave sum(numeric) pointing at an OID that no longer exists, and every
- * query using sum(numeric) in that database would fail in the planner with
- * "cache lookup failed for function NNNN" -- a broken database, not a lost
- * optimisation.  With it, DROP EXTENSION fails cleanly instead, and so does
- * DROP EXTENSION ... CASCADE, because sum(numeric) is pinned and refuses to
- * be dropped along with us.  pps_detach_support() is then the one way out,
- * which is the intended one.
- */
-static void
-pps_set_prosupport(Oid aggfnoid, Oid supportfn)
-{
-	Relation	rel;
-	HeapTuple	tup;
-	Form_pg_proc form;
-	Oid			oldsupport;
-	ObjectAddress myself;
-	ObjectAddress referenced;
-
-	rel = table_open(ProcedureRelationId, RowExclusiveLock);
-
-	tup = SearchSysCacheCopy1(PROCOID, ObjectIdGetDatum(aggfnoid));
-	if (!HeapTupleIsValid(tup))
-		elog(ERROR, "cache lookup failed for function %u", aggfnoid);
-	form = (Form_pg_proc) GETSTRUCT(tup);
-	oldsupport = form->prosupport;
-
-	/* already in the state the caller wants */
-	if (oldsupport == supportfn)
-	{
-		heap_freetuple(tup);
-		table_close(rel, RowExclusiveLock);
-		return;
-	}
-
-	/*
-	 * Refuse to take over an entry somebody else owns, in either direction.
-	 * A future release could give sum(numeric) a support function of its own,
-	 * and silently replacing it -- or clearing it on detach -- would disable
-	 * a core optimisation with nothing to show for it.
-	 */
-	if (OidIsValid(oldsupport) && OidIsValid(supportfn))
-		ereport(ERROR,
-				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				 errmsg("%s already has the support function %s",
-						format_procedure(aggfnoid),
-						format_procedure(oldsupport)),
-				 errhint("Only one support function can be attached to an aggregate.")));
-
-	form->prosupport = supportfn;
-	CatalogTupleUpdate(rel, &tup->t_self, tup);
-
-	ObjectAddressSet(myself, ProcedureRelationId, aggfnoid);
-
-	if (OidIsValid(oldsupport))
-		deleteDependencyRecordsForSpecific(ProcedureRelationId, aggfnoid,
-										   DEPENDENCY_NORMAL,
-										   ProcedureRelationId, oldsupport);
-	if (OidIsValid(supportfn))
-	{
-		ObjectAddressSet(referenced, ProcedureRelationId, supportfn);
-		recordDependencyOn(&myself, &referenced, DEPENDENCY_NORMAL);
-	}
-
-	heap_freetuple(tup);
-	table_close(rel, RowExclusiveLock);
-
-	/* the next lookup of aggfnoid has to see this */
-	CommandCounterIncrement();
-}
-
-/*
- * pps_attach_or_detach
- *		The body of both SQL-callable functions: sum(numeric) and
- *		avg(numeric) either point at pps_agg_support() or they do not.
- *
- * Whether the plan cache needs flushing is the same question the GUC assign
- * hooks answer: a saved generic plan built before the attachment does not
- * replan by itself.  Attaching happens during CREATE EXTENSION, where there
- * is nothing planned with it yet; detaching is the case that matters, and
- * both are cheap enough to just do unconditionally.
- */
-static void
-pps_attach_or_detach(FunctionCallInfo fcinfo, bool attach)
-{
-	Oid			ourfn;
-	int			i;
-
-#if !PPS_USE_AGGREF_SUPPORT
-	ereport(ERROR,
-			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-			 errmsg("aggregate support functions require PostgreSQL 19 or later"),
-			 errdetail("On PostgreSQL 18 the rewrites are reached through agg_simplify_hook instead; load the library with shared_preload_libraries, session_preload_libraries or LOAD.")));
-#endif
-
-	if (!superuser())
-		ereport(ERROR,
-				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-				 errmsg("must be superuser to change the support function of a built-in aggregate")));
-
-	ourfn = pps_agg_support_oid(fcinfo);
-
-	for (i = 0; i < lengthof(pps_target_aggregates); i++)
-	{
-		Oid			argtypes[1] = {NUMERICOID};
-		List	   *aggname;
-		Oid			aggfnoid;
-
-		aggname = list_make2(makeString(pstrdup("pg_catalog")),
-							 makeString(pstrdup(pps_target_aggregates[i])));
-		aggfnoid = LookupFuncName(aggname, 1, argtypes, false);
-
-		/*
-		 * On detach, leave alone anything that is not ours: see the comment
-		 * in pps_set_prosupport() about a future core support function.
-		 */
-		if (!attach && get_func_support(aggfnoid) != ourfn)
-			continue;
-
-		pps_set_prosupport(aggfnoid, attach ? ourfn : InvalidOid);
-	}
-
-	ResetPlanCache();
-}
-
-/*
- * pps_attach_support
- *		Make the planner call us for sum(numeric) and avg(numeric).
- *
- * Run by the install script on 19 and later, and available by hand after
- * anything that resets pg_proc without running it -- a dump and restore, for
- * one: pg_dump does not carry catalog rows of pg_catalog objects, so a
- * restored database has the extension but not the attachment.
- */
-Datum
-pps_attach_support(PG_FUNCTION_ARGS)
-{
-	pps_attach_or_detach(fcinfo, true);
-
-	PG_RETURN_VOID();
-}
-
-/*
- * pps_detach_support
- *		Give sum(numeric) and avg(numeric) back.  Run this before DROP
- *		EXTENSION -- the dependency recorded by the attachment makes the drop
- *		fail until you do.
- */
-Datum
-pps_detach_support(PG_FUNCTION_ARGS)
-{
-	pps_attach_or_detach(fcinfo, false);
-
-	PG_RETURN_VOID();
 }
 
 /*

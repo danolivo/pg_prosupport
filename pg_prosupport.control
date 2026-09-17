@@ -1,4 +1,18 @@
 comment = 'plan-time aggregate rewrites through the prosupport machinery'
 default_version = '1.0'
 module_pathname = '$libdir/pg_prosupport'
-relocatable = true
+
+# Not relocatable, and pinned to a schema of our own.
+#
+# pps_attach_support()/pps_detach_support() are plpgsql and have to name
+# pps_agg_support() from inside their own bodies.  @extschema@ is substituted
+# once, when the install script runs, so a later ALTER EXTENSION ... SET SCHEMA
+# would leave those bodies pointing at the old schema -- at nothing, or worse,
+# at a same-named function of another installation.  Forbidding the move is
+# what makes the qualified name true forever.
+#
+# CREATE EXTENSION creates the schema itself when it does not exist; the price
+# is that the schema is no longer the DBA's to choose, so
+# CREATE EXTENSION pg_prosupport SCHEMA something_else is now an error.
+relocatable = false
+schema = 'prosupport'
