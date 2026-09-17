@@ -199,7 +199,7 @@ StaticAssertDecl(offsetof(struct NumericShort, n_data) == 2,
  * NumericAggState does: numeric_sum() looks at them before it looks at the
  * sum, and our final function has to reproduce that order.
  */
-typedef struct NasAggState
+typedef struct BoundedAggState
 {
 	/*
 	 * INT128, not a bare __int128.  The difference is not cosmetic: the
@@ -246,7 +246,7 @@ typedef struct NasAggState
  * recomputing.
  */
 StaticAssertDecl(sizeof(BoundedAggState) == 56,
-				 "NasAggState changed size; recompute sspace in "
+				 "BoundedAggState changed size; recompute sspace in "
 				 "pg_prosupport--1.0.sql");
 
 #define PPS_TOTAL_COUNT(st) \
@@ -735,7 +735,7 @@ pps_bounded_accum(PG_FUNCTION_ARGS)
 		elog(ERROR, "pps_bounded_accum called in non-aggregate context");
 
 	/*
-	 * First call - initialize the state and check that teh aggregate parameters
+	 * First call - initialize the state and check that the aggregate parameters
 	 * set in the correct values.
 	 */
 	if (PG_ARGISNULL(0))

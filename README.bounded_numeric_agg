@@ -54,9 +54,9 @@ like it would stay in memory spills.
 The state: one cache line, no pointers
 ----------------------------------------
 
-NasAggState (numeric_agg.c) replaces all of that with:
+BoundedAggState (numeric_agg.c) replaces all of that with:
 
-    typedef struct NasAggState
+    typedef struct BoundedAggState
     {
         INT128      sumX;         /* sum of mantissas at scale "scale" */
         int64       N;
@@ -64,7 +64,7 @@ NasAggState (numeric_agg.c) replaces all of that with:
         int64       pInfcount;
         int64       nInfcount;
         int32       scale;
-    } NasAggState;
+    } BoundedAggState;
 
 Fifty-six bytes (checked by a StaticAssertDecl, so a change here that isn't
 matched in pg_prosupport--1.0.sql's sspace fails the build, not silently
