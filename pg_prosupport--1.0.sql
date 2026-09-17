@@ -21,10 +21,23 @@ CREATE FUNCTION pps_bounded_sum_final(internal) RETURNS numeric
 CREATE FUNCTION pps_bounded_avg_final(internal) RETURNS numeric
   AS 'MODULE_PATHNAME', 'pps_bounded_avg_final' LANGUAGE C IMMUTABLE;
 
--- No support function to create and attach here: the substitution is done by
--- agg_simplify_hook, a global planner hook that _PG_init() installs when the
--- library is loaded (shared_preload_libraries, session_preload_libraries, or
--- LOAD) -- see the README and pg_prosupport.c.
+-- The planner support function of pg_catalog.sum(numeric) and
+-- pg_catalog.avg(numeric) on PostgreSQL 19 and later, where constant folding
+-- calls an aggregate's prosupport entry with a SupportRequestSimplifyAggref.
+-- It is created on every branch so that this script stays version-independent;
+-- on 18 nothing ever calls it, because there the rewrites are reached through
+-- agg_simplify_hook instead -- see the README and pg_prosupport.c.
+CREATE FUNCTION pps_agg_support(internal) RETURNS internal
+  AS 'MODULE_PATHNAME', 'pps_agg_support' LANGUAGE C STRICT;
+
+-- Attaching the function above to two built-in aggregates is a write to
+-- pg_proc, which ALTER FUNCTION ... SUPPORT will not do for an aggregate, so
+-- these two do it (dependency included, so that DROP EXTENSION cannot leave
+-- sum(numeric) pointing at an OID that no longer exists).  Superuser only.
+CREATE FUNCTION pps_attach_support() RETURNS void
+  AS 'MODULE_PATHNAME', 'pps_attach_support' LANGUAGE C;
+CREATE FUNCTION pps_detach_support() RETURNS void
+  AS 'MODULE_PATHNAME', 'pps_detach_support' LANGUAGE C;
 
 -- Two aggregates covering 1 <= p <= 28, differing only in the final function,
 -- exactly as core shares numeric_avg_accum between sum() and avg().  They are
@@ -97,3 +110,15 @@ CREATE AGGREGATE bounded_numeric_avg_mul(numeric, numeric, int4, int4) (
   finalfunc    = pps_bounded_avg_final,
   parallel     = safe
 );
+
+-- Last, once every aggregate the rewrites can substitute exists: hand
+-- sum(numeric) and avg(numeric) over to pps_agg_support().  Only on 19 and
+-- later, where the planner reads that entry; on 18 pps_attach_support()
+-- refuses to run, and the hook from patches/ does the same job instead.
+DO $$
+BEGIN
+  IF current_setting('server_version_num')::int >= 190000 THEN
+    PERFORM pps_attach_support();
+  END IF;
+END
+$$;

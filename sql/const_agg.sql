@@ -162,4 +162,12 @@ RESET parallel_tuple_cost;
 RESET min_parallel_table_scan_size;
 
 DROP TABLE t_const, t_constref, t_empty;
+-- see the note on this block at the end of numeric_agg.sql
+DO $$
+BEGIN
+  IF current_setting('server_version_num')::int >= 190000 THEN
+    PERFORM pps_detach_support();
+  END IF;
+END
+$$;
 DROP EXTENSION pg_prosupport;

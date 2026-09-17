@@ -518,4 +518,16 @@ DROP TABLE t_ok, t_wide, t_w28, t_w29, t_plain, t_int0, t_frac, t_dom, t_dom2,
 		   t_bulk, t_ref, t_big, t_bigw, t_ab, t_avgref, t_mul, t_mulref;
 DROP DOMAIN money18_2;
 DROP DOMAIN money18;
+-- On PG19+ the extension owns the prosupport entry of sum(numeric) and
+-- avg(numeric), and the pg_depend record that goes with it makes DROP
+-- EXTENSION fail until the entry is given back; on 18 there is nothing
+-- attached and pps_detach_support() refuses to run.  Written as a DO block so
+-- that the output is the same on every branch -- see the README.
+DO $$
+BEGIN
+  IF current_setting('server_version_num')::int >= 190000 THEN
+    PERFORM pps_detach_support();
+  END IF;
+END
+$$;
 DROP EXTENSION pg_prosupport;

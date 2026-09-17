@@ -4,20 +4,20 @@
  *	  Plan-time substitution of specialised aggregates for sum(numeric) and
  *	  avg(numeric).
  *
- * pg_prosupport.c's pps_agg_simplify_hook() calls pps_simplify_bounded_numeric_agg()
+ * pg_prosupport.c's pps_simplify_aggref() calls pps_simplify_bounded_numeric_agg()
  * below once for every Aggref in every query, one of a fixed sequence of
  * independent rewrites (see that function's own comment); it is this
  * function's job to recognise sum(numeric)/avg(numeric) by aggfnoid and, if
  * the input can be shown to be narrow enough, return a new Aggref carrying a
- * different aggfnoid.  Anything else is declined immediately.  This module
- * owns one GUC, pg_prosupport.bounded_numeric_agg (on by default), that gates this
- * rewrite alone -- constagg.c's constant fold is a separate rewrite behind a
- * separate switch, no longer reached from here.
+ * different aggfnoid.  Anything else is declined immediately.
  *
  * The proof is static.  It comes either from the argument's declared typmod or
  * from arithmetic over declared operands (see pps_derive_bounds): at
- * 1 <= p <= 28 the mantissa value * 10^s is below 10^28 ~ 2^93, so the int128
- * accumulator cannot overflow in fewer than about 1.7e10 rows.
+ * 1 <= p <= 28 the mantissa value * 10^s is below 10^28, a shade over 2^93, so
+ * the int128 accumulator cannot overflow in fewer than 1.7e10 rows.  That is a
+ * bound, not a guarantee: the transition functions enforce it themselves, and
+ * a group that does reach it gets an error rather than a wrong sum.  See
+ * PPS_MAX_ADDENDS in numeric_agg.c.
  *
  * The scale is passed as a second, constant argument.  That makes it an
  * explicit input of the transition function rather than something guessed from
@@ -36,6 +36,7 @@
 
 #include "catalog/pg_type.h"
 #include "commands/extension.h"
+#include "common/int128.h"
 #include "fmgr.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
@@ -154,8 +155,8 @@ pps_load_oids(void)
 	if (!OidIsValid(pps_sum_numeric_oid) || !OidIsValid(pps_avg_numeric_oid))
 		elog(ERROR, "could not find pg_catalog.sum(numeric) or pg_catalog.avg(numeric)");
 
-	extoid = get_extension_oid("pg_prosupport", false);
-	nsp = get_extension_schema(extoid);
+	extoid = get_extension_oid("pg_prosupport", true);
+	nsp = OidIsValid(extoid) ? get_extension_schema(extoid) : InvalidOid;
 	if (OidIsValid(nsp))
 	{
 		char	   *nspname = get_namespace_name(nsp);
@@ -184,12 +185,21 @@ pps_load_oids(void)
 		OidIsValid(pps_bounded_avg_mul_oid);
 	pps_cache_valid = true;
 
+	/*
+	 * Missing aggregates are not an error.  On PostgreSQL 18 the library is
+	 * preloaded for the whole cluster while the extension is created per
+	 * database, so a database that has the library but not the extension is
+	 * an ordinary configuration, not a broken one -- and this function runs
+	 * for every Aggref of every query there, count(*) included.  Raising here
+	 * would make such a database unable to plan an aggregate at all; the
+	 * right answer is to leave the OIDs invalid and let
+	 * pps_simplify_bounded_numeric_agg() decline, so the query simply gets
+	 * the stock aggregate.
+	 */
 	if (!pps_oids_ok)
-		elog(ERROR, "pg_prosupport: the specialised aggregates were "
+		elog(DEBUG1, "pg_prosupport: the specialised aggregates were "
 			 "not found; the extension does not appear to be created "
 			 "in this database");
-
-	return;
 }
 
 /*
@@ -609,12 +619,48 @@ pps_simplify_bounded_numeric_agg(struct PlannerInfo *root, Aggref *agg)
 	else
 		return NULL;
 
-	Assert(agg->aggsplit == AGGSPLIT_SIMPLE);
-	Assert(list_length(agg->args) == 1);
-
-	/* Just not yet checked */
-	if (agg->aggvariadic || agg->agglevelsup != 0)
+	/* nothing to substitute: see the note in pps_load_oids() */
+	if (!OidIsValid(newfn))
 		return NULL;
+
+	/*
+	 * aggsplit is not tested: the request reaches us from
+	 * eval_const_expressions_mutator() during preprocessing, before the
+	 * planner splits the aggregate, so it is always AGGSPLIT_SIMPLE here.
+	 * Partial aggregation is in fact supported -- through combinefunc -- and
+	 * a test for it would mislead the reader.
+	 */
+	Assert(agg->aggsplit == AGGSPLIT_SIMPLE);
+
+	/*
+	 * The shapes we decline rather than try to work around.  DISTINCT and
+	 * ORDER BY are not cosmetic here: both are expressed in terms of the
+	 * argument list, and the replacement appends a scale argument to it, so
+	 * sum(v ORDER BY w) -- whose sort column is already the second entry of
+	 * agg->args -- would end up with two arguments numbered 2 and an
+	 * aggargtypes that no longer matches.  That is a crash in the executor,
+	 * not a wrong sum, and the product fold, which rebuilds the argument list
+	 * outright, is worse still.  FILTER would in fact survive both rewrites,
+	 * but it is declined with them: the price of a mistake in this function
+	 * is a silently wrong answer, so the narrow, proven shape is the one that
+	 * fires.
+	 */
+	if (agg->aggdistinct != NIL || agg->aggorder != NIL ||
+		agg->aggfilter != NULL || agg->aggvariadic ||
+		agg->agglevelsup != 0)
+	{
+		pps_decline(agg->aggfnoid,
+					"DISTINCT, ORDER BY, FILTER, VARIADIC or an outer "
+					"reference is present");
+		return NULL;
+	}
+
+	if (list_length(agg->args) != 1)
+	{
+		pps_decline(agg->aggfnoid,
+					"aggregate does not have exactly one argument");
+		return NULL;
+	}
 
 	tle = (TargetEntry *) linitial(agg->args);
 

@@ -3,37 +3,51 @@
 Extra PostgreSQL query tree optimisations that might be done with the prosupport
 machinery.
 
-One PostgreSQL patch, plus an extension that builds on top of it.
+An extension, and — on one branch only — a PostgreSQL patch underneath it.
+Which of the two entry points below the planner offers depends on the server,
+and that is the only thing that differs between the branches; the rewrites
+themselves are the same code either way.
 
-**`patches/0001-Introduce-agg_simplify_hook-to-postgres-18.patch` adds
-`agg_simplify_hook`**, a single planner hook: the planner calls it, if set,
-for every `Aggref` it meets while simplifying the query tree, and whatever
+**On PostgreSQL 19 and later there is nothing to patch.** Core calls an
+aggregate's own `pg_proc.prosupport` function with a
+`SupportRequestSimplifyAggref` while it simplifies the query tree (commit
+`42473b3b31`, the one that turns `COUNT(1)` into `COUNT(*)`), and that is the
+entry point used there: `pps_agg_support()` is attached to
+`pg_catalog.sum(numeric)` and `pg_catalog.avg(numeric)` by
+`pps_attach_support()`, which `CREATE EXTENSION` runs for you. Nothing has to
+be preloaded — the library is `dlopen()`ed the first time the planner
+resolves the support function. The attachment is a write to `pg_proc`, since
+`ALTER FUNCTION ... SUPPORT` refuses an aggregate outright, so it comes with
+`pps_detach_support()` — **which has to be run before `DROP EXTENSION`**; see
+Removal below.
+
+**On PostgreSQL 18 there is no such call, hence the patch.**
+`patches/0001-Introduce-agg_simplify_hook-to-postgres-18.patch` adds
+`agg_simplify_hook`, a single planner hook: the planner calls it, if set, for
+every `Aggref` it meets while simplifying the query tree, and whatever
 non-`NULL` node the hook returns takes the `Aggref`'s place — the same point
-in planning, and the same shape of rewrite, that PostgreSQL 19's
-`SupportRequestSimplifyAggref` reaches through `pg_proc.prosupport` (commit
-`42473b3b31`, which turns `COUNT(1)` into `COUNT(*)`). Unlike that
-catalog-driven dispatch, `agg_simplify_hook` is a plain global hook — in the
-same family as `planner_hook`, `set_rel_pathlist_hook` and
-`join_search_hook` — added to the planner on purpose in favour of the
-catalog machinery: no `pg_proc.prosupport` write, no `pg_depend` bookkeeping,
-no per-aggregate attachment to get wrong. This is the pre-PG19 target: on a
-server old enough not to have `SupportRequestSimplifyAggref` at all, this one
-hook is the only entry point any of the rewrites below need.
+in planning, and the same shape of rewrite that 19 reaches through the
+catalog. It is a plain global hook, in the same family as `planner_hook`,
+`set_rel_pathlist_hook` and `join_search_hook`: no `pg_proc.prosupport`
+write, no `pg_depend` bookkeeping, no per-aggregate attachment to get wrong —
+and, on the other hand, a library that has to be preloaded, because a hook,
+unlike a catalog entry, is not resolved on demand.
 
-**This extension is where every rewrite reached through that hook lives** --
-all of them, with nothing left for core to do unconditionally. Its own hook
-function, `pps_agg_simplify_hook()` in `pg_prosupport.c`, decides, from
-`aggref->aggfnoid` and its arguments alone, which aggregates it wants and
-leaves everything else — the overwhelming majority of calls — alone. That
-includes the case that would be the obvious candidate for a core-level
-shortcut, a plain `sum(column)` whose typmod is known outright: it reaches
-this hook exactly the same way `sum(a + b)` or `avg(column)` does, and is
-recognised the same way, through `pps_derive_bounds()`.
+**This extension is where every rewrite reached through either entry point
+lives** -- all of them, with nothing left for core to do unconditionally.
+`pps_simplify_aggref()` in `pg_prosupport.c` decides, from `aggref->aggfnoid`
+and its arguments alone, which aggregates it wants and leaves everything else
+— the overwhelming majority of calls — alone. That includes the case that
+would be the obvious candidate for a core-level shortcut, a plain
+`sum(column)` whose typmod is known outright: it arrives here exactly the same
+way `sum(a + b)` or `avg(column)` does, and is recognised the same way,
+through `pps_derive_bounds()`.
 
-`numeric_agg`/`const_agg` (`make installcheck`) pass against a PG18 built
-with the patch, and PG18's own `make check` (231/231) is unaffected by it:
-the hook is `NULL` — one predicted-not-taken branch per `Aggref` — on a
-server where nothing has installed it.
+`numeric_agg`/`const_agg` (`make check`) pass on master through the catalog
+entry point, with no patch involved at all, and against a PG18 built with the
+patch. PG18's own `make check` (231/231) is unaffected by the patch: the hook
+is `NULL` — one predicted-not-taken branch per `Aggref` — on a server where
+nothing has installed it.
 
 Rewrites, where they live, and what governs them:
 
@@ -43,7 +57,7 @@ Rewrites, where they live, and what governs them:
 | `sum(c)` for a constant `c` → `c * NULLIF(count(*), 0)::numeric`; the aggregation disappears | `constagg.c` | `pg_prosupport.fold_const_sum` — **off** by default |
 
 The two rewrites are independent: `pg_prosupport.c`'s
-`pps_agg_simplify_hook()` is a fixed sequence of two calls, one per module,
+`pps_simplify_aggref()` is a fixed sequence of two calls, one per module,
 each recognising its own aggregate shape and consulting only its own GUC --
 not one nested inside the other, and not a single switch governing both.
 `pg_prosupport.bounded_numeric_agg` only narrows which function accumulates
@@ -95,20 +109,41 @@ Load the extension first.
 
 Every rewrite this extension makes -- the plain-column and
 arithmetic-expression forms of `sum()`/`avg()`, the product fold, and the
-constant fold -- goes through `agg_simplify_hook`, so all of them need the
-extension loaded. There is no rewrite that works with only `CREATE EXTENSION`
-and no rewrite that works with only the library loaded; both steps below are
-required.
+constant fold -- arrives through the same entry point, so what it takes to
+get any of them is what it takes to get all of them. That differs by branch.
 
-There is no catalog attachment step, unlike a `SupportRequestSimplify`-based
-rewrite reached through `pg_proc.prosupport`: `agg_simplify_hook` is
-installed once, by `_PG_init()`, when the shared library is loaded — and
-that is the one thing `CREATE EXTENSION` on its own does *not* do. It
-creates `bounded_numeric_sum` and the rest as ordinary catalog objects,
-but the library itself is only `dlopen()`ed when one of its C functions is
-actually called, which none of these are until an `Aggref` has already been
-rewritten to name one. For the hook to ever run, load the library through
-one of the ways PostgreSQL offers for that:
+**PostgreSQL 19 and later:**
+
+```sql
+CREATE EXTENSION pg_prosupport;
+```
+
+That is the whole of it. The install script creates the aggregates and then
+calls `pps_attach_support()`, which points the `pg_proc.prosupport` entry of
+`pg_catalog.sum(numeric)` and `pg_catalog.avg(numeric)` at
+`pps_agg_support()`; from then on the planner resolves that function on
+demand and `dlopen()`s the library itself. Superuser only, because the
+attachment writes to `pg_proc` — and because it does, `DROP EXTENSION` is no
+longer unconditional; see Removal.
+
+The attachment is per database, like the extension, and it is not carried by
+`pg_dump` (catalog rows of `pg_catalog` objects never are). After a dump and
+restore the extension is there and the attachment is not, which is what
+`pps_attach_support()` is for by hand:
+
+```sql
+SELECT pps_attach_support();     -- idempotent; superuser
+```
+
+**PostgreSQL 18:** `CREATE EXTENSION` is not enough on its own, and neither
+is loading the library: both steps are required. The hook is installed once,
+by `_PG_init()`, when the shared library is loaded — and loading is the one
+thing `CREATE EXTENSION` does *not* do. It creates `bounded_numeric_sum` and
+the rest as ordinary catalog objects, but the library itself is only
+`dlopen()`ed when one of its C functions is actually called, which none of
+these are until an `Aggref` has already been rewritten to name one. For the
+hook to ever run, load the library through one of the ways PostgreSQL offers
+for that:
 
 ```
 # postgresql.conf, before the server starts — the normal way to run this
@@ -181,11 +216,14 @@ make USE_PGXS=1 PG_CONFIG=/path/to/bin/pg_config installcheck PGPORT=5432
 ```
 
 `numeric_agg` covers the scale specialisation, `const_agg` the constant
-rewrite. Both `LOAD 'pg_prosupport';` the way this README does, so they
-exercise `agg_simplify_hook` end to end -- which means the server under test
-needs `patches/0001-Introduce-agg_simplify_hook-to-postgres-18.patch` (or an
-equivalent for whichever version you are building) applied, not just
-PostgreSQL 15 or later for numeric's typmod encoding.
+rewrite. Both exercise the whole path end to end, so on PostgreSQL 18 the
+server under test needs
+`patches/0001-Introduce-agg_simplify_hook-to-postgres-18.patch` applied, not
+just PostgreSQL 15 or later for numeric's typmod encoding; on 19 and later no
+patch is involved and a stock server is enough. The `LOAD 'pg_prosupport';`
+the two scripts start with is what 18 needs and what 19 ignores -- there the
+extension is already reachable through `pg_proc` by then -- and the
+`pps_detach_support()` they end with is the other way round.
 
 ## sum() over a constant
 
@@ -354,7 +392,7 @@ rewrites (`sum()`/`avg()` over a plain column or an arithmetic expression,
 the product fold, and the constant fold).
 
 **Per session or per database** — GUCs, no superuser needed. Two switches,
-each governing exactly one of `pps_agg_simplify_hook()`'s two calls (see the
+each governing exactly one of `pps_simplify_aggref()`'s two calls (see the
 table above) and neither one reaching into the other:
 
 ```sql
@@ -375,22 +413,46 @@ plan-shape-preserving change, so it is on by default; `fold_const_sum`
 removes the aggregate from the plan outright, which is worth opting into
 rather than discovering after the fact, so it defaults to off.
 
-**Entirely** — remove `pg_prosupport` from `shared_preload_libraries` (or
-`session_preload_libraries`) and restart/reconnect; a session that loaded it
-with a bare `LOAD` stops having it the moment that session ends. Sessions
+**Entirely, on 19 and later** — give the two aggregates back:
+
+```sql
+SELECT pps_detach_support();
+```
+
+The next plan uses the stock `sum()`/`avg()` again; the call flushes the plan
+cache in the session that runs it, and other backends see the `pg_proc`
+change through the usual invalidation. `pps_attach_support()` puts it back.
+
+**Entirely, on 18** — remove `pg_prosupport` from `shared_preload_libraries`
+(or `session_preload_libraries`) and restart/reconnect; a session that loaded
+it with a bare `LOAD` stops having it the moment that session ends. Sessions
 that already hold a generic plan built with a rewrite in it keep using that
 plan until they replan; `DISCARD PLANS` or a reconnect settles that.
 
-**Removal.** In any order, and with no special care:
+**Removal.** On 18, in any order and with no special care:
 
 ```sql
 DROP EXTENSION pg_prosupport;
 ```
 
-There is nothing else pointing at its objects for a stale reference to break:
-unlike a hand-written `pg_proc.prosupport`, everything here is ordinary
-`pg_depend`-tracked catalog state, and the hook itself only ever runs while
-the library is loaded in the first place.
+On 19 and later, detach first:
+
+```sql
+SELECT pps_detach_support();
+DROP EXTENSION pg_prosupport;
+```
+
+The order is not advice, it is enforced. `pps_attach_support()` records a
+`pg_depend` entry from `sum(numeric)` to `pps_agg_support()`, so a `DROP
+EXTENSION` that skips the detach fails -- with
+`cannot drop function sum(numeric) because it is required by the database
+system`, since `sum(numeric)` is pinned and cannot be dropped along with us.
+That message is unhelpful but the behaviour behind it is the point: without
+the dependency the drop would succeed and leave `sum(numeric)` pointing at an
+OID that no longer exists, and every query using `sum(numeric)` in that
+database would then fail in the planner with `cache lookup failed for
+function NNNN`. A refused `DROP EXTENSION` is a much better failure than a
+database that can no longer add up a column.
 
 ## Licence
 

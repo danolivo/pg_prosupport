@@ -5,7 +5,7 @@
  *
  * This is a different optimisation from the one in numeric_support.c, called
  * independently and in its own right from pg_prosupport.c's
- * pps_agg_simplify_hook() -- the two share nothing now but
+ * pps_simplify_aggref() -- the two share nothing now but
  * pps_get_sum_numeric_oid(), a read-only accessor for which aggregate is
  * pg_catalog.sum(numeric), so this module does not have to keep a second
  * cache of the same catalog fact.  There the aggregate stays and its
@@ -156,7 +156,7 @@ pps_const_arg(Aggref *agg)
  * pps_simplify_const_sum
  *		Build the replacement for sum(<numeric constant>), or return NULL.
  *
- * Called directly from pg_prosupport.c's pps_agg_simplify_hook() for every
+ * Called directly from pg_prosupport.c's pps_simplify_aggref() for every
  * Aggref, so unlike before this function establishes for itself, from
  * pps_get_sum_numeric_oid(), that agg really is pg_catalog.sum(numeric) --
  * nothing upstream has narrowed that down any more.

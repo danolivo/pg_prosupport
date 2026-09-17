@@ -47,6 +47,20 @@
 #endif
 
 /*
+ * numeric_add_opt_error() was renamed to numeric_add_safe() in PostgreSQL 19,
+ * where its last argument changed from a bool * ("set this instead of raising
+ * an error") to a Node *escontext, the soft-error convention the rest of the
+ * tree had moved to.  NULL means "raise the error yourself" in both, which is
+ * what the single caller below wants, so one macro covers every branch we
+ * build against.
+ */
+#if PG_VERSION_NUM >= 190000
+#define pps_numeric_add(n1, n2)		numeric_add_safe((n1), (n2), NULL)
+#else
+#define pps_numeric_add(n1, n2)		numeric_add_opt_error((n1), (n2), NULL)
+#endif
+
+/*
  * The on-disk layout of numeric.  utils/numeric.h does not expose it -- it is
  * private to numeric.c -- so the extension has to repeat it here.  Checked
  * against master as of fd2b89854d9; the format has not changed since 8.3, but
@@ -136,12 +150,12 @@ StaticAssertDecl(offsetof(struct NumericShort, n_data) == 2,
  * The highest precision we accept.
  *
  * The ceiling is set by the accumulator's headroom, not by the width of the
- * mantissa.  At p = 28 a value is below 10^28 ~ 2^93, so reaching 2^127 takes
- * 2^34 addends, about 17 billion -- the same order of headroom that sum(int8)
- * relies on when it accumulates into int128 with no checks at all.  At p = 36,
- * which does occur in 1C schemas, the mantissa reaches 2^120: two addends fit
- * in an int128 and the third overflows, so that range needs a different
- * accumulator.  Hence 28 rather than 38.
+ * mantissa.  At p = 28 a value is below 10^28, which is a shade over 2^93, so
+ * the accumulator takes on the order of 1.7e10 addends before it reaches
+ * 2^127; PPS_MAX_ADDENDS below turns that into a hard limit.  At p = 36, which
+ * does occur in 1C schemas, the mantissa reaches 2^120: two addends fit in an
+ * int128 and the third overflows, so that range needs a different accumulator.
+ * Hence 28 rather than 38.
  *
  * There is deliberately no separate variant for p <= 18 keeping the mantissa
  * in an int64, although one existed and looked like the obvious optimisation.
@@ -152,6 +166,33 @@ StaticAssertDecl(offsetof(struct NumericShort, n_data) == 2,
  * too.  A second transition function buying nothing is not worth keeping.
  */
 #define PPS_MAX_PRECISION	28
+
+/*
+ * The largest number of addends the accumulator is allowed to take.
+ *
+ * Every addend is a mantissa with at most PPS_MAX_PRECISION decimal digits, so
+ * after N of them |sumX| <= N * (10^28 - 1).  That stays inside an int128 as
+ * long as
+ *
+ *		N <= (2^127 - 1) / (10^28 - 1) = 17014118346
+ *
+ * which is the constant below.  Note that it is a little *under* 2^34 =
+ * 17179869184: 10^28 is about 1.0097 * 2^93, not 2^93, and the odd percent
+ * matters once the number is used as a hard limit rather than as an order of
+ * magnitude.  A folded product obeys the same bound because the support
+ * function only folds when p1 + p2 <= PPS_MAX_PRECISION; see
+ * PPS_MAX_FACTOR_PRECISION.
+ *
+ * Why this is tested at all, when sum(int8) accumulates into an int128 with no
+ * test whatever: there each addend is below 2^63, so the limit is 2^64 addends
+ * and no table will ever reach it.  Here the addends are thirty binary orders
+ * wider and the limit comes down to 1.7e10 rows in a single group -- large, but
+ * no longer absurd for a fact table.  Overflow of a signed 128-bit integer is
+ * undefined behaviour, not a wrapped result, so "the sum would come out wrong"
+ * understates it.  The test costs one compare against a constant on a counter
+ * we increment anyway, which is not worth economising on.
+ */
+#define PPS_MAX_ADDENDS		INT64CONST(17014118346)
 
 /*
  * The aggregate state.  Special values are counted separately, exactly as
@@ -260,17 +301,27 @@ pps_int128_neg(INT128 *i128)
 }
 
 /*
- * PG_INT128_HI_INT64 / PG_INT128_LO_UINT64
+ * pps_int128_hi_int64 / pps_int128_lo_uint64
  *		The high and low 64-bit halves of an INT128, in the same layout
- *		common/int128.h uses for its emulated struct.  Neither accessor is
- *		exposed by that header -- it only ever hands out whole INT128
- *		values -- but pps_bounded_serialize()/pps_bounded_deserialize() have to
- *		ship the two halves separately down the wire, and
- *		pps_int128_fits_int64() below has to look at them individually to
- *		test for sign extension.
+ *		common/int128.h uses for its emulated struct.  Needed by
+ *		pps_bounded_serialize()/pps_bounded_deserialize(), which ship the two
+ *		halves separately down the wire, and by pps_int128_fits_int64() below,
+ *		which looks at them individually to test for sign extension.
+ *
+ * On PostgreSQL 18 that header hands out whole INT128 values only and exposes
+ * no accessor at all.  PostgreSQL 19 added PG_INT128_HI_INT64() and
+ * PG_INT128_LO_UINT64(), which do exactly this -- hence the private names
+ * here.  Reusing the upstream ones would be worse than a redefinition: since
+ * they are function-like macros, the preprocessor would rewrite the
+ * definitions below into a call to itself, and the compiler would report a
+ * missing type specifier several lines away from the actual cause.
+ *
+ * The same reasoning applies to the three helpers further down, which
+ * PostgreSQL 19 also grew: everything this file needs from an INT128 beyond
+ * what 18 provides is defined here, once, and used on every branch.
  */
 static inline int64
-PG_INT128_HI_INT64(INT128 v)
+pps_int128_hi_int64(INT128 v)
 {
 #if USE_NATIVE_INT128
 	return (int64) (((uint128) v) >> 64);
@@ -280,7 +331,7 @@ PG_INT128_HI_INT64(INT128 v)
 }
 
 static inline uint64
-PG_INT128_LO_UINT64(INT128 v)
+pps_int128_lo_uint64(INT128 v)
 {
 #if USE_NATIVE_INT128
 	return (uint64) v;
@@ -290,13 +341,13 @@ PG_INT128_LO_UINT64(INT128 v)
 }
 
 /*
- * make_int128
+ * pps_make_int128
  *		The inverse of the two accessors above: rebuild an INT128 from its
  *		halves, the way pps_bounded_deserialize() needs after reading them
  *		back separately.
  */
 static inline INT128
-make_int128(int64 hi, uint64 lo)
+pps_make_int128(int64 hi, uint64 lo)
 {
 #if USE_NATIVE_INT128
 	return (((INT128) hi) << 64) | (INT128) lo;
@@ -310,17 +361,17 @@ make_int128(int64 hi, uint64 lo)
 }
 
 /*
- * int128_add_int128
+ * pps_int128_add_int128
  *		*i128 += addend.
  *
- * common/int128.h has no such helper: every core caller only ever adds a
- * bare int64 or an int64*int64 product into an accumulator.
+ * PostgreSQL 18's common/int128.h has no such helper: every core caller there
+ * only ever adds a bare int64 or an int64*int64 product into an accumulator.
  * pps_bounded_accum() and pps_bounded_combine() are the exception, merging one
  * full 128-bit accumulator into another, so it is provided here in the same
  * style as pps_int128_mul_add() and pps_int128_neg() above.
  */
 static inline void
-int128_add_int128(INT128 *i128, INT128 addend)
+pps_int128_add_int128(INT128 *i128, INT128 addend)
 {
 #if USE_NATIVE_INT128
 	*i128 += addend;
@@ -337,17 +388,18 @@ int128_add_int128(INT128 *i128, INT128 addend)
 }
 
 /*
- * int128_div_mod_int32
+ * pps_int128_div_mod_int32
  *		*i128 /= divisor, truncating toward zero; *remainder is set to the
  *		truncating remainder, which takes the sign of the original *i128.
  *
  * divisor must be a positive int32 well below 2^31 -- the only caller,
  * pps_int128_to_numeric(), only ever passes 1000000000 -- so the emulated
  * path below does not have to worry about a negative or overflowing
- * divisor.
+ * divisor.  (PostgreSQL 19's int128_div_mod_int32() is the same operation
+ * without that restriction.)
  */
 static inline void
-int128_div_mod_int32(INT128 *i128, int32 divisor, int32 *remainder)
+pps_int128_div_mod_int32(INT128 *i128, int32 divisor, int32 *remainder)
 {
 #if USE_NATIVE_INT128
 	INT128		q;
@@ -417,8 +469,8 @@ int128_div_mod_int32(INT128 *i128, int32 divisor, int32 *remainder)
 static inline bool
 pps_int128_fits_int64(INT128 v, int64 *out)
 {
-	int64		hi = PG_INT128_HI_INT64(v);
-	uint64		lo = PG_INT128_LO_UINT64(v);
+	int64		hi = pps_int128_hi_int64(v);
+	uint64		lo = pps_int128_lo_uint64(v);
 
 	if ((hi == 0 && (lo >> 63) == 0) ||
 		(hi == -1 && (lo >> 63) == 1))
@@ -608,6 +660,49 @@ pps_make_state(MemoryContext aggcontext, int32 scale)
 }
 
 /*
+ * pps_accum_overflow
+ *		Complain that the accumulator has taken all the addends it can hold.
+ *
+ * Out of line and deliberately not inlined into its callers: what is left at
+ * each call site is a single compare against a constant, which the branch
+ * predictor gets right every time, and none of the ereport() machinery is in
+ * the transition function's instruction footprint.
+ */
+static void
+pps_accum_overflow(void)
+{
+	ereport(ERROR,
+			(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+			 errmsg("too many values for specialised numeric aggregate"),
+			 errdetail("The specialisation accumulates at most " INT64_FORMAT
+					   " values per group.",
+					   PPS_MAX_ADDENDS),
+			 errhint("Set pg_prosupport.bounded_numeric_agg to off to fall back "
+					 "on the built-in aggregate, which has no such limit.")));
+}
+
+/*
+ * pps_check_addends
+ *		Raise an error if taking "adding" more addends could overflow the
+ *		accumulator that already holds "have" of them.
+ *
+ * Both counts are known to be non-negative and no larger than PPS_MAX_ADDENDS,
+ * so the subtraction below cannot itself overflow.  It is written that way
+ * round rather than as (have + adding > PPS_MAX_ADDENDS) so that it stays
+ * correct if that ever stops being true.
+ *
+ * Callers must call this *before* the addition, not after: once the addition
+ * has happened the undefined behaviour has happened with it, and there is
+ * nothing left to detect.
+ */
+static inline void
+pps_check_addends(int64 have, int64 adding)
+{
+	if (unlikely(have > PPS_MAX_ADDENDS - adding))
+		pps_accum_overflow();
+}
+
+/*
  * pps_bounded_accum
  *		Transition function: (internal, numeric, int4) -> internal.
  *
@@ -673,15 +768,17 @@ pps_bounded_accum(PG_FUNCTION_ARGS)
 		INT128		m;
 
 		/*
-		 * Overflow of the accumulator is unreachable, and that has to be
-		 * argued rather than hoped for: |m| < 10^28 ~ 2^93, so passing 2^127
-		 * would take 2^34 addends, about 17 billion.  Same argument that lets
-		 * sum(int8) accumulate into int128 unchecked.  A broken typmod promise
-		 * is caught not here but when the mantissa is extracted -- that is,
-		 * before it can corrupt the sum.
+		 * Two separate things can go wrong here, and they are caught in two
+		 * separate places.  A value wider than the declaration -- a broken
+		 * typmod promise -- is caught when the mantissa is extracted, below,
+		 * that is before it can corrupt the sum.  Overflow of the accumulator
+		 * itself is caught here, before the addition rather than after it; see
+		 * PPS_MAX_ADDENDS for why it is worth testing at all.
 		 */
+		pps_check_addends(st->N, 1);
+
 		if (likely(pps_get_bounded_int128(c, datalen, st->scale, &m)))
-			int128_add_int128(&st->sumX, m);
+			pps_int128_add_int128(&st->sumX, m);
 		else
 			ereport(ERROR,
 					(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
@@ -894,11 +991,13 @@ pps_bounded_accum_mul(PG_FUNCTION_ARGS)
 						   "outside that declaration.")));
 
 	/*
-	 * Overflow of the accumulator is unreachable for the same reason as in the
-	 * plain case, one step removed: the support function only fires when
-	 * p1 + p2 <= PPS_MAX_PRECISION, so |ma * mb| < 10^28 ~ 2^93 and reaching
-	 * 2^127 would take 2^34 rows.
+	 * The product obeys the same bound as a plain mantissa, one step removed:
+	 * the support function only fires when p1 + p2 <= PPS_MAX_PRECISION, so
+	 * |ma * mb| < 10^28 and PPS_MAX_ADDENDS applies unchanged.  Tested before
+	 * the addition, exactly as in pps_bounded_accum().
 	 */
+	pps_check_addends(st->N, 1);
+
 	int128_add_int64_mul_int64(&st->sumX, ma, mb);
 	st->N++;
 
@@ -960,7 +1059,16 @@ pps_bounded_combine(PG_FUNCTION_ARGS)
 		elog(ERROR, "mismatched scales in pps_bounded_combine: %d vs %d",
 			 st1->scale, st2->scale);
 
-	int128_add_int128(&st1->sumX, st2->sumX);
+	/*
+	 * The test in the transition functions bounds each partial state on its
+	 * own; it says nothing about their sum.  Without this the parallel plan
+	 * would drive straight past the limit that the serial plan stops at, and
+	 * the same query would be safe or not depending on whether the planner
+	 * chose to parallelise it.
+	 */
+	pps_check_addends(st1->N, st2->N);
+
+	pps_int128_add_int128(&st1->sumX, st2->sumX);
 	st1->N += st2->N;
 	st1->NaNcount += st2->NaNcount;
 	st1->pInfcount += st2->pInfcount;
@@ -997,8 +1105,8 @@ pps_bounded_serialize(PG_FUNCTION_ARGS)
 	pq_sendint64(&buf, st->NaNcount);
 	pq_sendint64(&buf, st->pInfcount);
 	pq_sendint64(&buf, st->nInfcount);
-	pq_sendint64(&buf, PG_INT128_HI_INT64(st->sumX));
-	pq_sendint64(&buf, (int64) PG_INT128_LO_UINT64(st->sumX));
+	pq_sendint64(&buf, pps_int128_hi_int64(st->sumX));
+	pq_sendint64(&buf, (int64) pps_int128_lo_uint64(st->sumX));
 
 	result = pq_endtypsend(&buf);
 	PG_RETURN_BYTEA_P(result);
@@ -1040,7 +1148,19 @@ pps_bounded_deserialize(PG_FUNCTION_ARGS)
 	st->nInfcount = pq_getmsgint64(&buf);
 	hi = pq_getmsgint64(&buf);
 	lo = (uint64) pq_getmsgint64(&buf);
-	st->sumX = make_int128(hi, lo);
+	st->sumX = pps_make_int128(hi, lo);
+
+	/*
+	 * The counts come from a worker running our own transition function, so
+	 * none of these can be true -- but they arrive through a bytea that
+	 * nothing else validates, and pps_bounded_combine() is about to do
+	 * arithmetic on N that assumes the bound holds.  Checking here keeps that
+	 * assumption honest rather than making it depend on the wire.
+	 */
+	if (unlikely(st->N < 0 || st->NaNcount < 0 ||
+				 st->pInfcount < 0 || st->nInfcount < 0 ||
+				 st->N > PPS_MAX_ADDENDS))
+		elog(ERROR, "corrupted serialised aggregate state");
 
 	pq_getmsgend(&buf);
 
@@ -1096,8 +1216,8 @@ pps_int128_to_numeric(INT128 v, int scale)
 		int32		r0;
 		int32		r1;
 
-		int128_div_mod_int32(&v, 1000000000, &r0);
-		int128_div_mod_int32(&v, 1000000000, &r1);
+		pps_int128_div_mod_int32(&v, 1000000000, &r0);
+		pps_int128_div_mod_int32(&v, 1000000000, &r1);
 		part[i] = (int64) r1 * INT64CONST(1000000000) + r0;
 	}
 	part[2] = int128_to_int64(v);
@@ -1111,13 +1231,11 @@ pps_int128_to_numeric(INT128 v, int scale)
 	res = int64_div_fast_to_numeric(part[0], scale);
 
 	if (part[1] != 0)
-		res = numeric_add_opt_error(res,
-									int64_div_fast_to_numeric(part[1], scale - 18),
-									NULL);
+		res = pps_numeric_add(res,
+							  int64_div_fast_to_numeric(part[1], scale - 18));
 	if (part[2] != 0)
-		res = numeric_add_opt_error(res,
-									int64_div_fast_to_numeric(part[2], scale - 36),
-									NULL);
+		res = pps_numeric_add(res,
+							  int64_div_fast_to_numeric(part[2], scale - 36));
 
 	return res;
 }
