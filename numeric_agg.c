@@ -652,24 +652,23 @@ PG_FUNCTION_INFO_V1(pps_bounded_avg_final);
  * pps_make_state
  *		Allocate the state in the aggregate's memory context.
  *
- * The context is not optional: the state outlives the call, and if an error is
- * thrown part way through a group there is nobody left to free it by hand --
- * resetting the context does that reliably.
+ * The state has to survive from one transition call to the next, and the
+ * per-tuple context it would land in by default is reset after every input row.
  */
 static BoundedAggState *
 pps_make_state(MemoryContext aggcontext, int32 scale)
 {
-	MemoryContext oldcontext;
-	BoundedAggState *st;
+	MemoryContext	 	oldcontext;
+	BoundedAggState	   *state;
 
 	Assert(scale >= 0 && scale <= PPS_MAX_PRECISION);
 
 	oldcontext = MemoryContextSwitchTo(aggcontext);
-	st = (BoundedAggState *) palloc0(sizeof(BoundedAggState));
+	state = (BoundedAggState *) palloc0(sizeof(BoundedAggState));
 	MemoryContextSwitchTo(oldcontext);
 
-	st->scale = scale;
-	return st;
+	state->scale = scale;
+	return state;
 }
 
 /*
@@ -719,9 +718,9 @@ pps_check_addends(int64 have, int64 adding)
  * pps_bounded_accum
  *		Transition function: (internal, numeric, int4) -> internal.
  *
- * The third argument is the constant planted by the support function.  It is a
- * constant by construction, so the scale is read once when the state is
- * created and never looked at again.
+ * First argument: the transition state of the aggregate
+ * Second argument: input value to add
+ * Third argument: scale (isn't changed during execution).
  */
 Datum
 pps_bounded_accum(PG_FUNCTION_ARGS)

@@ -24,13 +24,10 @@ CREATE FUNCTION pps_bounded_avg_final(internal) RETURNS numeric
 -- The planner support function of pg_catalog.sum(numeric) and
 -- pg_catalog.avg(numeric) on PostgreSQL 19 and later, where constant folding
 -- calls an aggregate's prosupport entry with a SupportRequestSimplifyAggref.
--- It is created on every branch so that this script stays version-independent;
--- on 18 nothing ever calls it, because there the rewrites are reached through
--- agg_simplify_hook instead -- see the README and pg_prosupport.c.
 CREATE FUNCTION pps_agg_support(internal) RETURNS internal
   AS 'MODULE_PATHNAME', 'pps_agg_support' LANGUAGE C STRICT;
 
--- Attaching the function above to two built-in aggregates is a write to
+-- Attaching the prosupport function to built-in aggregates is a write to
 -- pg_proc, which ALTER FUNCTION ... SUPPORT will not do for an aggregate, so
 -- these two do it (dependency included, so that DROP EXTENSION cannot leave
 -- sum(numeric) pointing at an OID that no longer exists).  Superuser only.
