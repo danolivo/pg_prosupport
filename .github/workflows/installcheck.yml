@@ -1,0 +1,168 @@
+# contrib/pg_prosupport/.github/workflows/installcheck.yml
+#
+# Runs "make installcheck" against every PostgreSQL the extension claims to
+# support, in both INT128 flavours.
+#
+# On 18 the rewrite is reached through agg_simplify_hook, which is not
+# in vanilla PostgreSQL -- it comes from patches/ and has to be applied to the
+# server before the extension will even compile.  From 19 on the hook is not
+# needed, because SupportRequestSimplifyAggref took its place.
+#
+# Copyright (c) 2026, Andrei Lepikhov
+# Released under the MIT licence; see the LICENSE file in this directory.
+
+name: installcheck
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  installcheck:
+    name: PG ${{ matrix.pg.name }} / INT128 ${{ matrix.int128 }}
+    runs-on: ubuntu-24.04
+
+    # Only master is allowed to be red: it moves under us, and a rename
+    # upstream should be news rather than a blocked pull request.
+    continue-on-error: ${{ matrix.pg.experimental || false }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        pg:
+          - name: "18"
+            ref: REL_18_STABLE
+            patch: patches/0001-Introduce-agg_simplify_hook-to-postgres-18.patch
+          - name: "19"
+            ref: REL_19_STABLE
+            patch: ""
+          - name: "master"
+            ref: master
+            patch: ""
+            experimental: true
+        # The emulated branch of common/int128.h is live code here -- every
+        # pps_int128_*() helper has two bodies -- and nothing else in the
+        # matrix would ever compile it.
+        int128: [native, emulated]
+
+    env:
+      PGHOME: ${{ github.workspace }}/pgsql
+      PGDATA: ${{ github.workspace }}/pgdata
+      PGHOST: /tmp
+      PGPORT: "55432"
+      PGDATABASE: postgres
+
+    steps:
+      - name: Check out the extension
+        uses: actions/checkout@v4
+        with:
+          path: ext
+
+      - name: Check out PostgreSQL
+        uses: actions/checkout@v4
+        with:
+          repository: postgres/postgres
+          ref: ${{ matrix.pg.ref }}
+          path: postgres
+          fetch-depth: 1
+
+      - name: Identify the server build
+        id: server
+        working-directory: postgres
+        run: |
+          set -eu
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          if [ -n "${{ matrix.pg.patch }}" ]; then
+            echo "patchsum=$(sha256sum "$GITHUB_WORKSPACE/ext/${{ matrix.pg.patch }}" | cut -c1-16)" >> "$GITHUB_OUTPUT"
+          else
+            echo "patchsum=none" >> "$GITHUB_OUTPUT"
+          fi
+
+      # The server install is keyed on the commit *and* on the patch, so a
+      # change to patches/ invalidates it.  Without that a stale cache would
+      # silently test yesterday's hook.
+      - name: Restore the server install
+        id: pgcache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.PGHOME }}
+          key: pg-${{ runner.os }}-${{ steps.server.outputs.sha }}-${{ steps.server.outputs.patchsum }}-cassert-v1
+
+      - name: Install build dependencies
+        if: steps.pgcache.outputs.cache-hit != 'true'
+        run: |
+          set -eu
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential flex bison
+
+      - name: Apply the agg_simplify_hook patch
+        if: steps.pgcache.outputs.cache-hit != 'true' && matrix.pg.patch != ''
+        working-directory: postgres
+        run: git apply --3way --verbose "$GITHUB_WORKSPACE/ext/${{ matrix.pg.patch }}"
+
+      - name: Build and install PostgreSQL
+        if: steps.pgcache.outputs.cache-hit != 'true'
+        working-directory: postgres
+        run: |
+          set -eu
+          ./configure --prefix="$PGHOME" \
+            --enable-debug --enable-cassert \
+            --without-icu --without-readline --without-zlib
+          # Plain "install", not "install-bin": PGXS needs the headers and
+          # lib/pgxs/src/makefiles/pgxs.mk, which the -bin targets leave out.
+          make -s -j"$(nproc)"
+          make -s install
+
+      - name: Put the server on PATH
+        run: echo "$PGHOME/bin" >> "$GITHUB_PATH"
+
+      # PG_CPPFLAGS reaches only the extension's own translation units; the
+      # server is already compiled and is not affected.  That is exactly the
+      # configuration we want to test, because the extension never hands an
+      # INT128 across the ABI boundary -- it only keeps one in its own state.
+      - name: Build and install the extension
+        working-directory: ext
+        run: |
+          set -eu
+          FLAGS=""
+          if [ "${{ matrix.int128 }}" = "emulated" ]; then
+            FLAGS="-DUSE_NATIVE_INT128=0"
+          fi
+          make USE_PGXS=1 PG_CONFIG="$PGHOME/bin/pg_config" PG_CPPFLAGS="$FLAGS" -j"$(nproc)"
+          make USE_PGXS=1 PG_CONFIG="$PGHOME/bin/pg_config" install
+
+      - name: Start the server
+        run: |
+          set -eu
+          initdb -D "$PGDATA" --no-sync -A trust
+          pg_ctl -D "$PGDATA" -l "$GITHUB_WORKSPACE/postmaster.log" \
+            -o "-k /tmp -p $PGPORT -h ''" -w start
+          psql -c 'select version()'
+
+      - name: make installcheck
+        working-directory: ext
+        run: make USE_PGXS=1 PG_CONFIG="$PGHOME/bin/pg_config" installcheck
+
+      # regression.diffs is the only thing worth reading when this fails, and
+      # it does not survive the runner.
+      - name: Collect the wreckage
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diffs-pg${{ matrix.pg.name }}-${{ matrix.int128 }}
+          path: |
+            ext/regression.diffs
+            ext/regression.out
+            ext/results/
+            postmaster.log
+          if-no-files-found: ignore
+
+      - name: Stop the server
+        if: always()
+        run: pg_ctl -D "$PGDATA" -m immediate stop
