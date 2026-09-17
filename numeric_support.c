@@ -119,11 +119,12 @@ pps_typmod_scale(int32 typmod)
  *
  * All names are schema-qualified, so search_path has no say in the result --
  * which matters, or the substitution would happen or not depending on a
- * session setting.  The extension's own schema is resolved dynamically
- * because the extension is relocatable; unlike a catalog-attached support
- * function, agg_simplify_hook carries no OID of "self" to start from, so the
- * schema comes from pg_extension via get_extension_oid()/
- * get_extension_schema() instead of get_func_namespace().
+ * session setting.  The extension's own schema is resolved through
+ * pg_extension rather than assumed: unlike a catalog-attached support
+ * function, agg_simplify_hook carries no OID of "self" to start from, so
+ * get_extension_oid()/get_extension_schema() stand in for
+ * get_func_namespace().  That also answers "is the extension created in this
+ * database at all", which the block below depends on.
  */
 static void
 pps_load_oids(void)
@@ -146,6 +147,20 @@ pps_load_oids(void)
 										 1, builtin_args, true);
 	if (!OidIsValid(pps_sum_numeric_oid) || !OidIsValid(pps_avg_numeric_oid))
 		elog(ERROR, "could not find pg_catalog.sum(numeric) or pg_catalog.avg(numeric)");
+
+	/*
+	 * Clear them before looking them up again.  Not tidiness: the block below
+	 * is skipped when the extension is gone, and without this the four OIDs
+	 * would keep the values they had while it existed.  A session that has the
+	 * library loaded -- which on 18 is any session that ran CREATE EXTENSION,
+	 * because the C-language validator dlopen's it -- would then go on
+	 * rewriting Aggrefs to aggregates that DROP EXTENSION has deleted, and the
+	 * next execution fails with "cache lookup failed for aggregate NNNN".
+	 */
+	pps_bounded_sum_oid = InvalidOid;
+	pps_bounded_avg_oid = InvalidOid;
+	pps_bounded_sum_mul_oid = InvalidOid;
+	pps_bounded_avg_mul_oid = InvalidOid;
 
 	extoid = get_extension_oid("pg_prosupport", true);
 	nsp = OidIsValid(extoid) ? get_extension_schema(extoid) : InvalidOid;

@@ -51,6 +51,25 @@ BEGIN
   END IF;
 END
 $$;
+-- Is the rewrite reachable in *this* session right now?  Not the same question
+-- as "which branch is this", which is what this file used to ask and got
+-- wrong.  On 19 and later the planner reads sum(numeric)'s prosupport entry,
+-- so the answer is whether we are attached.  On 18 the rewrite arrives through
+-- agg_simplify_hook, which _PG_init() installs when the library is loaded --
+-- and CREATE EXTENSION loads it in the session that runs it, because the
+-- C-language validator dlopen's the library to check the symbols.  So on 18
+-- the answer is simply whether the extension exists: this session created it.
+CREATE FUNCTION pps_rewrite_live() RETURNS boolean
+LANGUAGE sql STABLE AS $$
+  SELECT CASE
+           WHEN current_setting('server_version_num')::int >= 190000
+             THEN EXISTS (SELECT 1 FROM pg_proc
+                           WHERE oid = 'pg_catalog.sum(numeric)'::regprocedure
+                             AND prosupport <> 0)
+           ELSE EXISTS (SELECT 1 FROM pg_extension
+                         WHERE extname = 'pg_prosupport')
+         END
+$$;
 SELECT pps_check(true, 'after CREATE EXTENSION');
  pps_check 
 -----------
@@ -148,14 +167,14 @@ DO $$
 DECLARE
   r     record;
   plan  text := '';
-  pg19  boolean := current_setting('server_version_num')::int >= 190000;
+  live  boolean := pps_rewrite_live();
   total numeric;
 BEGIN
   FOR r IN EXECUTE 'EXPLAIN (costs off, verbose) SELECT sum(v) FROM pps_gp' LOOP
     plan := plan || r."QUERY PLAN" || E'\n';
   END LOOP;
-  IF (plan LIKE '%bounded_numeric_sum%') <> pg19 THEN
-    RAISE EXCEPTION 'plan for a non-superuser does not match the branch: %', plan;
+  IF (plan LIKE '%bounded_numeric_sum%') <> live THEN
+    RAISE EXCEPTION 'plan for a non-superuser does not match the session: %', plan;
   END IF;
 
   SELECT sum(v) INTO total FROM pps_gp;		-- must not raise
@@ -196,10 +215,10 @@ END
 $$;
 DO $$
 DECLARE
-  pg19 boolean := current_setting('server_version_num')::int >= 190000;
+  live boolean := pps_rewrite_live();
 BEGIN
-  IF pps_plan_has_rewrite() <> pg19 THEN
-    RAISE EXCEPTION 'generic plan before detach does not match the branch';
+  IF pps_plan_has_rewrite() <> live THEN
+    RAISE EXCEPTION 'generic plan before detach does not match the session';
   END IF;
 END
 $$;
@@ -221,8 +240,8 @@ SELECT pps_check(false, 'after detach');
 
 DO $$
 BEGIN
-  IF pps_plan_has_rewrite() THEN
-    RAISE EXCEPTION 'the generic plan still carries the rewrite after detach';
+  IF pps_plan_has_rewrite() <> pps_rewrite_live() THEN
+    RAISE EXCEPTION 'the generic plan does not match the session after detach';
   END IF;
 END
 $$;
@@ -285,5 +304,6 @@ DEALLOCATE gp;
 RESET plan_cache_mode;
 DROP TABLE pps_gp;
 DROP FUNCTION pps_plan_has_rewrite();
+DROP FUNCTION pps_rewrite_live();
 DROP FUNCTION pps_check(boolean, text);
 DROP ROLE regress_pps_plain;
