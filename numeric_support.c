@@ -401,11 +401,8 @@ pps_const_int(Node *node, int *value)
  * than as a corrupted sum.  That is the reason this is allowed to be clever at
  * all.
  *
- * depth bounds the recursion.  Eight is not a computed limit; it is more than
- * twice the depth of anything seen in the reporting queries this was written
- * for, and walking further into a user-written expression for an optimisation
- * we are free to decline buys nothing.  A long left-deep chain such as
- * a+b+c+d+... will therefore be declined, which is the intended trade.
+ * depth bounds the recursion. A long left-deep chain such as
+ * a+b+c+d+... will be declined, which is the intended trade.
  */
 #define PPS_MAX_DERIVE_DEPTH	8
 
@@ -626,48 +623,28 @@ pps_simplify_bounded_numeric_agg(struct PlannerInfo *root, Aggref *agg)
 	else
 		return NULL;
 
-	/* nothing to substitute: see the note in pps_load_oids() */
 	if (!OidIsValid(newfn))
 		return NULL;
 
 	/*
-	 * aggsplit is not tested: the request reaches us from
-	 * eval_const_expressions_mutator() during preprocessing, before the
-	 * planner splits the aggregate, so it is always AGGSPLIT_SIMPLE here.
-	 * Partial aggregation is in fact supported -- through combinefunc -- and
-	 * a test for it would mislead the reader.
+	 * The request reaches us from eval_const_expressions_mutator() during
+	 * preprocessing, before the planner splits the aggregate, so it is always
+	 * AGGSPLIT_SIMPLE here.
+	 * Partial aggregation is in fact supported - through combinefunc.
 	 */
 	Assert(agg->aggsplit == AGGSPLIT_SIMPLE);
 
 	/*
-	 * The shapes we decline rather than try to work around.  DISTINCT and
-	 * ORDER BY are not cosmetic here: both are expressed in terms of the
-	 * argument list, and the replacement appends a scale argument to it, so
-	 * sum(v ORDER BY w) -- whose sort column is already the second entry of
-	 * agg->args -- would end up with two arguments numbered 2 and an
-	 * aggargtypes that no longer matches.  That is a crash in the executor,
-	 * not a wrong sum, and the product fold, which rebuilds the argument list
-	 * outright, is worse still.  FILTER would in fact survive both rewrites,
-	 * but it is declined with them: the price of a mistake in this function
-	 * is a silently wrong answer, so the narrow, proven shape is the one that
-	 * fires.
+	 * The shapes we decline rather than try to work around.
+	 * For now this aggregate doesn't support any extra attributes in the args
+	 * list - that might be improved later.
 	 */
 	if (agg->aggdistinct != NIL || agg->aggorder != NIL ||
 		agg->aggfilter != NULL || agg->aggvariadic ||
 		agg->agglevelsup != 0)
-	{
-		pps_decline(agg->aggfnoid,
-					"DISTINCT, ORDER BY, FILTER, VARIADIC or an outer "
-					"reference is present");
 		return NULL;
-	}
 
-	if (list_length(agg->args) != 1)
-	{
-		pps_decline(agg->aggfnoid,
-					"aggregate does not have exactly one argument");
-		return NULL;
-	}
+	Assert(list_length(agg->args) == 1);
 
 	tle = (TargetEntry *) linitial(agg->args);
 
@@ -697,11 +674,9 @@ pps_simplify_bounded_numeric_agg(struct PlannerInfo *root, Aggref *agg)
 	}
 
 	/*
-	 * pps_derive_bounds() enforces the range as it goes - at p <= 28 the
-	 * mantissa is below 10^28 ~ 2^93 and the int128 accumulator holds ~1.7e10
-	 * addends - so there is nothing left to check here.  A negative scale
-	 * (possible since PG15) is rejected there too, or a -2 would end up in
-	 * 10^s and break everything quietly.
+	 * Enforce the range as it goes - at p <= 28 the mantissa is below 10^28 and
+	 * the int128 accumulator holds ~1.7e10 addends - so there is nothing left
+	 * to check here.
 	 */
 	if (!pps_derive_bounds((Node *) tle->expr, 0, &p, &s))
 		return NULL;

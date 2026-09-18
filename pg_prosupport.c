@@ -97,20 +97,9 @@ static agg_simplify_hook_type prev_agg_simplify_hook = NULL;
 static bool pps_ready = false;
 
 /*
- * pps_simplify_aggref
- *		Every rewrite this extension has, in a fixed order; NULL when none of
- *		them wanted this Aggref.
+ * Attempt to apply rewrite aggretate optimisations.
  *
- * Each call below is a whole rewrite owned by its own module -- its own
- * recognition of the aggregate shape, its own GUC, its own pps_decline()
- * logging -- and this function does not look inside any of them.  They are
- * tried in a fixed order rather than independently: sum() over a numeric
- * constant, with both switches on, could equally be eliminated by
- * pps_simplify_const_sum() or narrowed by pps_simplify_bounded_numeric_agg(),
- * and eliminating the aggregation outright is strictly the better plan, so
- * the constant fold goes first and whichever returns non-NULL first wins.
- * With pps_fold_const_sum off (the default), that case simply falls through
- * to the second call, unaffected.
+ * Return NULL if nothing has been applied.
  */
 static Node *
 pps_simplify_aggref(PlannerInfo *root, Aggref *aggref)
